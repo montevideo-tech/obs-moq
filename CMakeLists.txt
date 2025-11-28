@@ -16,6 +16,14 @@ add_library(${CMAKE_PROJECT_NAME} MODULE)
 find_package(libobs REQUIRED)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 
+add_library(hang SHARED IMPORTED)
+set(HANG_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/hang-lib")
+set_target_properties(hang PROPERTIES
+    IMPORTED_LOCATION "${HANG_LIB_DIR}/libhang.dylib"
+    INTERFACE_INCLUDE_DIRECTORIES "${HANG_LIB_DIR}"
+)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE hang)
+
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)

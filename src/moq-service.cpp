@@ -1,10 +1,10 @@
 #include "moq-service.h"
 
 // TODO: Define supported codecs.
-const char *audio_codecs[] = {"aac", nullptr};
+const char *audio_codecs[] = {"aac", "opus", nullptr};
 const char *video_codecs[] = {"h264", "hevc", "av1", nullptr};
 
-MoQService::MoQService(obs_data_t *settings, obs_service_t *) : server(), token(), stream_name()
+MoQService::MoQService(obs_data_t *settings, obs_service_t *) : server(), path()
 {
 	Update(settings);
 }
@@ -12,8 +12,7 @@ MoQService::MoQService(obs_data_t *settings, obs_service_t *) : server(), token(
 void MoQService::Update(obs_data_t *settings)
 {
 	server = obs_data_get_string(settings, "server");
-	token = obs_data_get_string(settings, "token");
-	stream_name = obs_data_get_string(settings, "stream_name");
+	path = obs_data_get_string(settings, "key");
 }
 
 obs_properties_t *MoQService::Properties()
@@ -23,8 +22,7 @@ obs_properties_t *MoQService::Properties()
 	// Adds properties to be modified by the UI.
 	// obs_property_t *obs_properties_add_text(obs_properties_t *props, const char *name, const char *desc, enum obs_text_type type)
 	obs_properties_add_text(ppts, "server", "URL", OBS_TEXT_DEFAULT);
-	obs_properties_add_text(ppts, "token", "Access Token", OBS_TEXT_PASSWORD);
-	obs_properties_add_text(ppts, "stream_name", "Stream Name", OBS_TEXT_DEFAULT);
+	obs_properties_add_text(ppts, "key", "Path", OBS_TEXT_DEFAULT);
 
 	return ppts;
 }
@@ -54,10 +52,8 @@ const char *MoQService::GetConnectInfo(enum obs_service_connect_info type)
 	switch (type) {
 	case OBS_SERVICE_CONNECT_INFO_SERVER_URL:
 		return server.c_str();
-	case OBS_SERVICE_CONNECT_INFO_BEARER_TOKEN:
-		return token.c_str();
-	case OBS_SERVICE_CONNECT_INFO_STREAM_ID:
-		return stream_name.c_str();
+	case OBS_SERVICE_CONNECT_INFO_STREAM_KEY:
+		return path.c_str();
 	default:
 		return nullptr;
 	}

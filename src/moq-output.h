@@ -2,6 +2,7 @@
 #include <obs-module.h>
 
 #include <string>
+#include "logger.h"
 
 class MoQOutput {
 public:
@@ -18,12 +19,13 @@ public:
 
 private:
 	// TODO: Add needed functions
+	void ConfigureVideoTrack();
+	void ConfigureAudioTrack();
 
 	obs_output_t *output;
 
 	std::string server_url;
-	std::string token;
-	std::string stream_name;
+	std::string path;
 
 	size_t total_bytes_sent;
 	int connect_time_ms;
