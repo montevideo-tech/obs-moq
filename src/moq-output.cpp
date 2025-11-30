@@ -116,13 +116,13 @@ void MoQOutput::Data(struct encoder_packet *packet)
 	}
 
 	if (packet->type == OBS_ENCODER_AUDIO) {
-		LOG_DEBUG("Received audio packet - size: %zu, dts: %lld", packet->size, packet->dts_usec);
-		hang_write_audio_packet_from_c(packet->data, packet->size, packet->dts_usec);
+		// LOG_DEBUG("Received audio packet - size: %zu, pts: %lld", packet->size, packet->pts);
+		hang_write_audio_packet_from_c(packet->data, packet->size, packet->pts);
 		return;
 	} else if (packet->type == OBS_ENCODER_VIDEO) {
-		LOG_DEBUG("Received video packet - size: %zu, keyframe: %s, dts: %lld", packet->size,
-			  packet->keyframe ? "yes" : "no", packet->dts_usec);
-		hang_write_video_packet_from_c(packet->data, packet->size, packet->keyframe, packet->dts_usec);
+		// LOG_DEBUG("Received video packet - size: %zu, keyframe: %s, pts: %lld", packet->size,
+			  // packet->keyframe ? "yes" : "no", packet->pts);
+		hang_write_video_packet_from_c(packet->data, packet->size, packet->keyframe, packet->pts);
 		total_bytes_sent += packet->size;
 		return;
 	}
@@ -151,7 +151,7 @@ void MoQOutput::ConfigureVideoTrack()
 	auto video_height = obs_encoder_get_height(encoder);
 
 	LOG_INFO("Video codec: %s, profile: %s, bitrate: %d, width: %d, height: %d", video_codec, profile, video_bitrate,
-		 video_height);
+            video_width, video_height);
 	return;
 }
 
