@@ -12,7 +12,7 @@ MoQOutput::MoQOutput(obs_data_t *, obs_output_t *output)
 	  server_url(),
 	  path(),
 	  total_bytes_sent(0),
-	  connect_time_ms(0),
+	  connect_time_ms(0), // TODO: Implement this.
 	  session(-1),
 	  video(-1),
 	  audio(-1),

@@ -6,7 +6,6 @@
 !/build-aux
 !/cmake
 !/data
-!/hang-c
 !/src
 !.clang-format
 !.gersemirc
