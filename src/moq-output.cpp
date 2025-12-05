@@ -16,7 +16,7 @@ MoQOutput::MoQOutput(obs_data_t *, obs_output_t *output)
 	  session(-1),
 	  video(-1),
 	  audio(-1),
-	  broadcast(hang_broadcast_create());
+	  broadcast(hang_broadcast_create())
 {
 }
 
@@ -62,9 +62,6 @@ bool MoQOutput::Start()
 		return false;
 	}
 
-	obs_data_t *encoder_settings = obs_encoder_get_settings(encoder);
-	const char *profile_str = obs_data_get_string(encoder_settings, "profile");
-
 	LOG_INFO("Connecting to MoQ server: %s", server_url.c_str());
 
 	// Create a callback to log when the session is closed
@@ -91,8 +88,6 @@ bool MoQOutput::Start()
 		LOG_ERROR("Failed to publish broadcast to session: %d", result);
 		return false;
 	}
-
-	obs_data_release(encoder_settings);
 
 	obs_output_begin_data_capture(output, 0);
 
@@ -183,7 +178,8 @@ void MoQOutput::VideoInit()
 	auto video_height = obs_encoder_get_height(encoder);
 	*/
 
-	video = hang_track_create(broadcast, video_codec);
+	const char *codec = obs_encoder_get_codec(encoder);
+	video = hang_track_create(broadcast, codec);
 	if (video < 0) {
 		LOG_ERROR("Failed to create video track: %d", video);
 		return;
@@ -224,7 +220,8 @@ void MoQOutput::AudioInit()
 	auto audio_bitrate = (int)obs_data_get_int(settings, "bitrate");
 	*/
 
-	audio = hang_track_create(broadcast, audio_codec);
+	const char *codec = obs_encoder_get_codec(encoder);
+	audio = hang_track_create(broadcast, codec);
 	if (audio < 0) {
 		LOG_ERROR("Failed to create audio track: %d", audio);
 		return;
