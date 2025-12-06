@@ -26,17 +26,34 @@ Prerequisites:
     cd obs-moq
     ```
 
-2.  Configure the project with CMake:
+2.  (temporary) Clone the moq repository if you haven't already:
     ```bash
-    cmake --preset macos # or windows/linux depending on your OS
+    git clone https://github.com/kixelated/moq.git ../moq
     ```
 
-3.  Build the plugin:
+3.  Configure the project with CMake:
     ```bash
-    cmake --build --preset macos --config Release
+    cmake --preset macos -DMOQ_LOCAL=../moq
     ```
 
-4.  Install the plugin to your OBS Studio plugins directory.
+4.  Build the plugin:
+    ```bash
+    cmake --build --preset macos
+    ```
+
+5.  Install the plugin to your OBS Studio plugins directory.
+```bash
+# macOS
+cp -a build_macos/RelWithDebInfo/obs-moq.plugin ~/Library/Application\ Support/obs-studio/plugins/
+```
+
+5a. Or if you're building against a local obs-studio checkout:
+```bash
+cp -a build_macos/RelWithDebInfo/obs-moq.plugin ../obs-studio/build_macos/frontend/RelWithDebInfo/OBS.app/Contents/PlugIns/
+
+# Run OBS Studio with some extra logging for debugging.
+RUST_LOG=debug RUST_BACKTRACE=1 OBS_LOG_LEVEL=debug ../obs-studio/build_macos/frontend/RelWithDebInfo/OBS.app/Contents/MacOS/OBS
+```
 
 ## Usage
 

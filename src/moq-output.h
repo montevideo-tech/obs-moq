@@ -1,6 +1,7 @@
 #pragma once
 #include <obs-module.h>
 
+#include <chrono>
 #include <string>
 #include "logger.h"
 
@@ -18,9 +19,10 @@ public:
 	inline int GetConnectTime() { return connect_time_ms; }
 
 private:
-	// TODO: Add needed functions
-	void ConfigureVideoTrack();
-	void ConfigureAudioTrack();
+	void VideoInit();
+	void VideoData(struct encoder_packet *packet);
+	void AudioInit();
+	void AudioData(struct encoder_packet *packet);
 
 	obs_output_t *output;
 
@@ -29,6 +31,12 @@ private:
 
 	size_t total_bytes_sent;
 	int connect_time_ms;
+	std::chrono::steady_clock::time_point connect_start;
+
+	int session;
+	int broadcast;
+	int video;
+	int audio;
 };
 
 void register_moq_output();

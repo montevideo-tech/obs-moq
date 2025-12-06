@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.28...3.30)
+cmake_minimum_required(VERSION 3.28)
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCOPE)
 
@@ -16,13 +16,30 @@ add_library(${CMAKE_PROJECT_NAME} MODULE)
 find_package(libobs REQUIRED)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 
-add_library(hang SHARED IMPORTED)
-set(HANG_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/hang-lib")
-set_target_properties(hang PROPERTIES
-    IMPORTED_LOCATION "${HANG_LIB_DIR}/libhang.dylib"
-    INTERFACE_INCLUDE_DIRECTORIES "${HANG_LIB_DIR}"
-)
+option(MOQ_LOCAL "Path to moq repo for local development" "")
+
+if(MOQ_LOCAL)
+    add_subdirectory(${MOQ_LOCAL}/rs/hang-c hang)
+else()
+    include(FetchContent)
+    FetchContent_Declare(hang
+        URL https://github.com/kixelated/moq/releases/download/v${HANG_VERSION}/hang-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}.tar.gz
+    )
+    FetchContent_MakeAvailable(hang)
+
+    add_library(hang SHARED IMPORTED GLOBAL)
+    set_target_properties(hang PROPERTIES
+        IMPORTED_LOCATION "${hang_SOURCE_DIR}/lib/libhang.dylib"
+        INTERFACE_INCLUDE_DIRECTORIES "${hang_SOURCE_DIR}/include"
+    )
+endif()
+
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE hang)
+
+add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:hang>
+            $<TARGET_BUNDLE_CONTENT_DIR:${CMAKE_PROJECT_NAME}>/MacOS/
+)
 
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
