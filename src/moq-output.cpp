@@ -13,9 +13,9 @@ MoQOutput::MoQOutput(obs_data_t *, obs_output_t *output)
 	  path(),
 	  total_bytes_sent(0),
 	  connect_time_ms(0),
-	  session(-1),
-	  video(-1),
-	  audio(-1),
+	  session(0),
+	  video(0),
+	  audio(0),
 	  broadcast(moq_broadcast_create())
 {
 }
@@ -106,9 +106,17 @@ bool MoQOutput::Start()
 void MoQOutput::Stop(bool signal)
 {
 	// Close the session
-	moq_session_close(session);
-	moq_track_close(video);
-	moq_track_close(audio);
+	if (session > 0) {
+		moq_session_close(session);
+	}
+
+	if (video > 0) {
+		moq_track_close(video);
+	}
+
+	if (audio > 0) {
+		moq_track_close(audio);
+	}
 
 	if (signal) {
 		obs_output_signal_stop(output, OBS_OUTPUT_SUCCESS);
@@ -134,24 +142,40 @@ void MoQOutput::Data(struct encoder_packet *packet)
 
 void MoQOutput::AudioData(struct encoder_packet *packet)
 {
-	if (audio < 0) {
+	if (audio == 0) {
 		AudioInit();
 	}
 
-	auto result = moq_track_write(audio, packet->data, packet->size, packet->pts);
-	if (result < 0) {
+	if (audio < 0) {
+		// We failed to initialize the audio track, so we can't write any data.
 		return;
 	}
+
+	auto pts = util_mul_div64(
+		packet->pts,
+		1000000ULL * packet->timebase_num,
+		packet->timebase_den
+	);
+
+	auto result = moq_track_write(audio, packet->data, packet->size, pts);
+	if (result < 0) {
+		LOG_ERROR("Failed to write audio frame: %d", result);
+		return;
+	}
+
 	total_bytes_sent += packet->size;
 }
 
 void MoQOutput::VideoData(struct encoder_packet *packet)
 {
-	if (video < 0) {
+	if (video == 0) {
 		VideoInit();
 	}
 
-	//auto pts = 1000000 * (packet->timebase_num * packet->pts) / packet->timebase_den;
+	if (video < 0) {
+		return;
+	}
+
 	auto pts = util_mul_div64(
 		packet->pts,
 		1000000ULL * packet->timebase_num,
@@ -160,9 +184,10 @@ void MoQOutput::VideoData(struct encoder_packet *packet)
 
 	auto result = moq_track_write(video, packet->data, packet->size, pts);
 	if (result < 0) {
-		LOG_ERROR("Failed to write video packet: %d", result);
+		LOG_ERROR("Failed to write video frame: %d", result);
 		return;
 	}
+
 	total_bytes_sent += packet->size;
 }
 
