@@ -39,8 +39,8 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE moq)
 if(APPLE)
     add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:moq>
-                $<TARGET_BUNDLE_CONTENT_DIR:${CMAKE_PROJECT_NAME}>/MacOS/
-)
+            $<TARGET_BUNDLE_CONTENT_DIR:${CMAKE_PROJECT_NAME}>/MacOS/
+    )
 endif()
 
 if(ENABLE_FRONTEND_API)
