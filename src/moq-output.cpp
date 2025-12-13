@@ -68,12 +68,13 @@ bool MoQOutput::Start()
 
 	// Create a callback to log when the session is connected or closed
 	auto session_connect_callback = [](void *user_data, int error_code) {
-		auto self = static_cast<MoQOutput*>(user_data);
+		auto self = static_cast<MoQOutput *>(user_data);
 
 		if (error_code == 0) {
 			auto elapsed = std::chrono::steady_clock::now() - self->connect_start;
 			self->connect_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
-			LOG_INFO("MoQ session established (%d ms): %s", self->connect_time_ms, self->server_url.c_str());
+			LOG_INFO("MoQ session established (%d ms): %s", self->connect_time_ms,
+				 self->server_url.c_str());
 		} else {
 			LOG_INFO("MoQ session closed (%d): %s", error_code, self->server_url.c_str());
 		}
@@ -151,11 +152,7 @@ void MoQOutput::AudioData(struct encoder_packet *packet)
 		return;
 	}
 
-	auto pts = util_mul_div64(
-		packet->pts,
-		1000000ULL * packet->timebase_num,
-		packet->timebase_den
-	);
+	auto pts = util_mul_div64(packet->pts, 1000000ULL * packet->timebase_num, packet->timebase_den);
 
 	auto result = moq_track_write(audio, packet->data, packet->size, pts);
 	if (result < 0) {
@@ -176,11 +173,7 @@ void MoQOutput::VideoData(struct encoder_packet *packet)
 		return;
 	}
 
-	auto pts = util_mul_div64(
-		packet->pts,
-		1000000ULL * packet->timebase_num,
-		packet->timebase_den
-	);
+	auto pts = util_mul_div64(packet->pts, 1000000ULL * packet->timebase_num, packet->timebase_den);
 
 	auto result = moq_track_write(video, packet->data, packet->size, pts);
 	if (result < 0) {
@@ -211,7 +204,6 @@ void MoQOutput::VideoInit()
 	auto video_width = obs_encoder_get_width(encoder);
 	auto video_height = obs_encoder_get_height(encoder);
 	*/
-
 
 	uint8_t *extra_data = nullptr;
 	size_t extra_size = 0;
