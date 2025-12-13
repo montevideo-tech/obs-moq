@@ -33,11 +33,17 @@ Prerequisites:
 
 3.  Configure the project with CMake:
     ```bash
+    just setup ../moq
+
+    # Alternatively:
     cmake --preset macos -DMOQ_LOCAL=../moq
     ```
 
 4.  Build the plugin:
     ```bash
+    just build
+
+    # Alternatively:
     cmake --build --preset macos
     ```
 
