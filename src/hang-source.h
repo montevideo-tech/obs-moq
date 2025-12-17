@@ -41,10 +41,7 @@ struct hang_source {
 	int32_t video_track_id;
 	int32_t audio_track_id;
 
-	// Video state
-	gs_texture_t *texture;
-	uint32_t width;
-	uint32_t height;
+	// Video state (for async video source)
 	enum video_format format;
 
 	// Audio state
@@ -70,11 +67,11 @@ struct hang_source {
 	struct audio_decoder *audio_decoder_context;
 	pthread_mutex_t decoder_mutex; // Protects decoder access during callbacks
 
-	// Decoded frame storage
-	uint8_t *current_frame_data;
-	size_t current_frame_size;
-	uint32_t current_frame_width;
-	uint32_t current_frame_height;
+	// Timestamp tracking for frame synchronization
+	uint64_t first_frame_pts_us;  // First frame's PTS from MoQ (microseconds)
+	uint64_t first_frame_obs_time_ns;  // OBS time when first frame arrived (nanoseconds)
+	uint64_t last_output_timestamp_ns;  // Last timestamp we sent to OBS (for monotonicity check)
+	bool has_first_frame;  // Whether we've received the first frame
 
 	// Running state
 	bool active;

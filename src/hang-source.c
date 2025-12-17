@@ -38,9 +38,6 @@ static void hang_source_destroy(void *data);
 static void hang_source_update(void *data, obs_data_t *settings);
 static void hang_source_activate(void *data);
 static void hang_source_deactivate(void *data);
-static void hang_source_video_render(void *data, gs_effect_t *effect);
-static uint32_t hang_source_get_width(void *data);
-static uint32_t hang_source_get_height(void *data);
 static obs_properties_t *hang_source_get_properties(void *data);
 static void hang_source_get_defaults(obs_data_t *settings);
 
@@ -63,9 +60,6 @@ struct obs_source_info hang_source_info = {
 	.update = hang_source_update,
 	.activate = hang_source_activate,
 	.deactivate = hang_source_deactivate,
-	.video_render = hang_source_video_render,
-	.get_width = hang_source_get_width,
-	.get_height = hang_source_get_height,
 	.get_properties = hang_source_get_properties,
 	.get_defaults = hang_source_get_defaults,
 	.icon_type = OBS_ICON_TYPE_MEDIA,
@@ -89,17 +83,17 @@ static void *hang_source_create(obs_data_t *settings, obs_source_t *source)
 	pthread_cond_init(&context->audio_cond, NULL);
 	pthread_mutex_init(&context->decoder_mutex, NULL);
 
-	// Initialize frame storage
-	context->current_frame_data = NULL;
-	context->current_frame_size = 0;
-	context->current_frame_width = 0;
-	context->current_frame_height = 0;
-
 	// Initialize queues
 	context->frame_queue_cap = 16;
 	context->frame_queue = bzalloc(sizeof(struct obs_source_frame *) * context->frame_queue_cap);
 	context->audio_queue_cap = 16;
 	context->audio_queue = bzalloc(sizeof(struct obs_source_audio *) * context->audio_queue_cap);
+
+	// Initialize timestamp tracking
+	context->has_first_frame = false;
+	context->first_frame_pts_us = 0;
+	context->first_frame_obs_time_ns = 0;
+	context->last_output_timestamp_ns = 0;
 
 	hang_source_update(context, settings);
 	return context;
@@ -143,20 +137,6 @@ static void hang_source_destroy(void *data)
 	nvdec_decoder_destroy(context);
 	audio_decoder_destroy(context);
 	pthread_mutex_unlock(&context->decoder_mutex);
-
-	// Clean up video resources
-	if (context->texture) {
-		gs_texture_destroy(context->texture);
-		context->texture = NULL;
-	}
-
-	// Clean up frame data (should already be cleaned by deactivate, but check to be safe)
-	pthread_mutex_lock(&context->frame_mutex);
-	if (context->current_frame_data) {
-		bfree(context->current_frame_data);
-		context->current_frame_data = NULL;
-	}
-	pthread_mutex_unlock(&context->frame_mutex);
 
 	// Clean up queues (should already be cleaned by deactivate, but check to be safe)
 	pthread_mutex_lock(&context->frame_mutex);
@@ -250,17 +230,8 @@ static void hang_source_activate(void *data)
 
 	CLOG_INFO( "Activating hang source with URL: %s, broadcast: %s", context->url, context->broadcast_path);
 
-	// Initialize decoders first (local operation, doesn't need network)
-	if (!nvdec_decoder_init(context)) {
-		CLOG_ERROR( "Failed to initialize video decoder");
-		return;
-	}
-
-	if (!audio_decoder_init(context)) {
-		CLOG_ERROR( "Failed to initialize audio decoder");
-		nvdec_decoder_destroy(context);
-		return;
-	}
+	// Note: Decoders are initialized in on_catalog() after we receive the catalog
+	// with codec information from moq_consume_video_config()
 
 	// 1. Create origin for consumption
 	context->origin_id = moq_origin_create();
@@ -299,8 +270,6 @@ cleanup:
 		moq_origin_close(context->origin_id);
 		context->origin_id = 0;
 	}
-	nvdec_decoder_destroy(context);
-	audio_decoder_destroy(context);
 }
 
 static void hang_source_deactivate(void *data)
@@ -351,18 +320,9 @@ static void hang_source_deactivate(void *data)
 		context->origin_id = 0;
 	}
 
-	// Clear current frame and queues BEFORE destroying decoders
+	// Clear queues BEFORE destroying decoders
 	// This prevents callbacks from accessing freed decoder resources
 	pthread_mutex_lock(&context->frame_mutex);
-	if (context->current_frame_data) {
-		bfree(context->current_frame_data);
-		context->current_frame_data = NULL;
-		context->current_frame_size = 0;
-		context->current_frame_width = 0;
-		context->current_frame_height = 0;
-	}
-
-	// Clear queues
 	for (size_t i = 0; i < context->frame_queue_len; i++) {
 		obs_source_frame_free(context->frame_queue[i]);
 	}
@@ -389,6 +349,12 @@ static void hang_source_deactivate(void *data)
 	audio_decoder_destroy(context);
 	pthread_mutex_unlock(&context->decoder_mutex);
 
+	// Reset timestamp tracking for next activation
+	context->has_first_frame = false;
+	context->first_frame_pts_us = 0;
+	context->first_frame_obs_time_ns = 0;
+	context->last_output_timestamp_ns = 0;
+
 	CLOG_INFO( "Hang source deactivated");
 }
 
@@ -408,71 +374,6 @@ static void hang_source_get_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_string(settings, "url", "");
 	obs_data_set_default_string(settings, "broadcast", "");
-}
-
-static void hang_source_video_render(void *data, gs_effect_t *effect)
-{
-	struct hang_source *context = data;
-
-	if (!context->active) {
-		return;
-	}
-
-	// Get the current frame data
-	pthread_mutex_lock(&context->frame_mutex);
-	if (context->current_frame_data && context->current_frame_width > 0 && context->current_frame_height > 0) {
-		uint32_t width = context->current_frame_width;
-		uint32_t height = context->current_frame_height;
-
-		// Create or update texture if needed
-		if (!context->texture || context->width != width || context->height != height) {
-			if (context->texture) {
-				gs_texture_destroy(context->texture);
-			}
-			context->texture = gs_texture_create(width, height, GS_RGBA, 1, NULL, GS_DYNAMIC);
-			context->width = width;
-			context->height = height;
-		}
-
-		if (context->texture) {
-			// Validate RGBA data (check if it's not all black)
-			bool has_data = false;
-			for (size_t i = 0; i < context->current_frame_size && i < 10000; i += 4) {
-				if (context->current_frame_data[i] > 0 || context->current_frame_data[i+1] > 0 ||
-				    context->current_frame_data[i+2] > 0) {
-					has_data = true;
-					break;
-				}
-			}
-
-			// Upload frame data to texture
-			gs_texture_set_image(context->texture, context->current_frame_data, width * 4, false);
-
-			// Render the texture
-			gs_eparam_t *param = gs_effect_get_param_by_name(effect, "image");
-			if (param) {
-				gs_effect_set_texture(param, context->texture);
-				gs_draw_sprite(context->texture, 0, width, height);
-			} else {
-				CLOG_ERROR( "Effect parameter 'image' not found");
-			}
-		} else {
-			CLOG_ERROR( "No texture available for rendering");
-		}
-	}
-	pthread_mutex_unlock(&context->frame_mutex);
-}
-
-static uint32_t hang_source_get_width(void *data)
-{
-	struct hang_source *context = data;
-	return context->current_frame_width > 0 ? context->current_frame_width : 1920;
-}
-
-static uint32_t hang_source_get_height(void *data)
-{
-	struct hang_source *context = data;
-	return context->current_frame_height > 0 ? context->current_frame_height : 1080;
 }
 
 // MoQ callback implementations (new API)
@@ -545,6 +446,48 @@ static void on_catalog(void *user_data, int32_t catalog_id)
 		context->audio_track_id = 0;
 	}
 
+	// Destroy existing decoders before reinitializing with new config
+	pthread_mutex_lock(&context->decoder_mutex);
+	nvdec_decoder_destroy(context);
+	audio_decoder_destroy(context);
+	pthread_mutex_unlock(&context->decoder_mutex);
+
+	// Get video configuration from catalog
+	struct moq_video_config video_config = {0};
+	int32_t video_config_result = moq_consume_video_config(catalog_id, 0, &video_config);
+	if (video_config_result < 0) {
+		CLOG_WARNING("Failed to get video config from catalog: %d", video_config_result);
+		// Fall back to default H.264 without extradata
+		video_config.codec = "h264";
+		video_config.codec_len = 4;
+		video_config.description = NULL;
+		video_config.description_len = 0;
+	} else {
+		CLOG_INFO("Video config: codec=%.*s, description_len=%zu",
+		          (int)video_config.codec_len, video_config.codec,
+		          video_config.description_len);
+		if (video_config.coded_width && video_config.coded_height) {
+			CLOG_INFO("Video dimensions: %ux%u",
+			          *video_config.coded_width, *video_config.coded_height);
+		}
+	}
+
+	// Initialize video decoder with config from catalog
+	if (!nvdec_decoder_init(context, video_config.codec, video_config.codec_len,
+	                        video_config.description, video_config.description_len)) {
+		CLOG_ERROR("Failed to initialize video decoder");
+		context->active = false;
+		return;
+	}
+
+	// Initialize audio decoder (placeholder for now)
+	if (!audio_decoder_init(context)) {
+		CLOG_ERROR("Failed to initialize audio decoder");
+		nvdec_decoder_destroy(context);
+		context->active = false;
+		return;
+	}
+
 	// Subscribe to first video track (index 0) with 100ms latency
 	context->video_track_id = moq_consume_video_track(
 		context->broadcast_id,
@@ -587,7 +530,6 @@ static void on_video_frame(void *user_data, int32_t frame_id)
 	}
 
 	if (frame_id <= 0) {
-		CLOG_ERROR( "Video frame error: %d", frame_id);
 		return;
 	}
 
@@ -595,7 +537,6 @@ static void on_video_frame(void *user_data, int32_t frame_id)
 	moq_frame frame = {0};
 	int32_t result = moq_consume_frame_chunk(frame_id, 0, &frame);
 	if (result < 0) {
-		CLOG_ERROR( "Failed to get video frame chunk: %d", result);
 		moq_consume_frame_close(frame_id);
 		return;
 	}
@@ -610,12 +551,16 @@ static void on_video_frame(void *user_data, int32_t frame_id)
 		return;
 	}
 
-	// Decode video frame using software decoder (or NVDEC on Linux)
-	if (nvdec_decoder_decode(context, frame.payload, frame.payload_size, frame.timestamp_us, frame.keyframe)) {
-		// Frame was decoded and queued
+	// Decode video frame using FFmpeg software decoder
+	// NOTE: If decode succeeds, output_decoded_frame() will unlock decoder_mutex
+	// before calling OBS API to avoid deadlocks. If decode fails, we unlock here.
+	bool decoded = nvdec_decoder_decode(context, frame.payload, frame.payload_size, frame.timestamp_us, frame.keyframe);
+	
+	if (!decoded) {
+		// Decode failed early (before output_decoded_frame), unlock mutex
+		pthread_mutex_unlock(&context->decoder_mutex);
 	}
-
-	pthread_mutex_unlock(&context->decoder_mutex);
+	// If decoded succeeded, mutex was already unlocked by output_decoded_frame()
 
 	// Release the frame
 	moq_consume_frame_close(frame_id);

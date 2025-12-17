@@ -1,5 +1,5 @@
 /*
-NVDEC Hardware Video Decoder for OBS Hang Source
+FFmpeg Software Video Decoder for OBS Hang Source
 Copyright (C) 2024 OBS Plugin Template
 
 This program is free software; you can redistribute it and/or modify
@@ -19,65 +19,71 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <obs-module.h>
 #include "logger-c.h"
 #include <util/threading.h>
+#include <util/platform.h>
 #include <graphics/graphics.h>
 #include <libavutil/frame.h>
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
 
-// FFmpeg headers for hardware acceleration
-#include <libavcodec/avcodec.h>
-#include <libavutil/hwcontext.h>
-#ifdef HAVE_NVDEC
-#include <libavutil/hwcontext_cuda.h>
-#endif
-
 #include "hang-source.h"
 
 // Function declarations
-static bool nvdec_init_cuda_decoder(struct nvdec_decoder *decoder);
-static bool nvdec_decode_frame(struct nvdec_decoder *decoder, const uint8_t *data, size_t size, uint64_t pts, struct hang_source *context);
-static bool software_decode_frame(struct nvdec_decoder *decoder, const uint8_t *data, size_t size, uint64_t pts, struct hang_source *context);
-static void store_decoded_frame(struct hang_source *context, uint8_t *data, size_t size, uint32_t width, uint32_t height);
+static bool decode_frame(struct nvdec_decoder *decoder, const uint8_t *data, size_t size, uint64_t pts, struct hang_source *context);
+static void output_decoded_frame(struct hang_source *context, uint8_t *data, uint32_t width, uint32_t height, uint64_t pts_us);
 static bool convert_mp4_nal_units_to_annex_b(const uint8_t *data, size_t size, uint8_t **out_data, size_t *out_size);
 
-struct nvdec_decoder {
-	// FFmpeg hardware acceleration context
-	AVBufferRef *hw_device_ctx;
-	AVCodecContext *codec_ctx;
-	struct SwsContext *sws_ctx;
-
-	// Video format information
-	uint32_t width;
-	uint32_t height;
-	enum AVPixelFormat pix_fmt;
-
-	// Reference to parent context for frame storage
-	struct hang_source *context;
-};
-
-bool nvdec_decoder_init(struct hang_source *context)
+// Parse codec string to FFmpeg codec ID
+// Supports: avc1/h264, hev1/hvc1/hevc, av01/av1
+static enum AVCodecID parse_codec_id(const char *codec, size_t codec_len)
 {
-	struct nvdec_decoder *decoder = bzalloc(sizeof(struct nvdec_decoder));
-	decoder->context = context;
-	context->nvdec_context = decoder;
-
-	// Try to initialize CUDA hardware acceleration with FFmpeg
-	if (!nvdec_init_cuda_decoder(decoder)) {
-		CLOG_WARNING( "CUDA hardware acceleration initialization failed, falling back to software decoding");
-		goto software_fallback;
+	if (!codec || codec_len == 0) {
+		return AV_CODEC_ID_H264; // Default to H.264
 	}
 
-	CLOG_INFO( "CUDA hardware accelerated decoder initialized successfully");
-	return true;
+	// H.264/AVC: "avc1.*" or "h264"
+	if ((codec_len >= 4 && strncmp(codec, "avc1", 4) == 0) ||
+	    (codec_len >= 4 && strncasecmp(codec, "h264", 4) == 0)) {
+		return AV_CODEC_ID_H264;
+	}
 
-software_fallback:
-	// Fallback to software decoding
-	CLOG_INFO( "Using software decoding fallback");
+	// HEVC/H.265: "hev1.*", "hvc1.*", or "hevc"
+	if ((codec_len >= 4 && strncmp(codec, "hev1", 4) == 0) ||
+	    (codec_len >= 4 && strncmp(codec, "hvc1", 4) == 0) ||
+	    (codec_len >= 4 && strncasecmp(codec, "hevc", 4) == 0) ||
+	    (codec_len >= 4 && strncasecmp(codec, "h265", 4) == 0)) {
+		return AV_CODEC_ID_HEVC;
+	}
 
-	// Initialize FFmpeg software decoder as fallback
-	const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
+	// AV1: "av01.*" or "av1"
+	if ((codec_len >= 4 && strncmp(codec, "av01", 4) == 0) ||
+	    (codec_len >= 3 && strncasecmp(codec, "av1", 3) == 0)) {
+		return AV_CODEC_ID_AV1;
+	}
+
+	CLOG_WARNING("Unknown codec: %.*s, defaulting to H.264", (int)codec_len, codec);
+	return AV_CODEC_ID_H264;
+}
+
+struct nvdec_decoder {
+	AVCodecContext *codec_ctx;
+	struct SwsContext *sws_ctx;
+};
+
+bool nvdec_decoder_init(struct hang_source *context, const char *codec_str, size_t codec_len,
+                        const uint8_t *description, size_t description_len)
+{
+	struct nvdec_decoder *decoder = bzalloc(sizeof(struct nvdec_decoder));
+	context->nvdec_context = decoder;
+
+	// Parse the codec string to get FFmpeg codec ID
+	enum AVCodecID codec_id = parse_codec_id(codec_str, codec_len);
+	CLOG_INFO("Initializing video decoder for codec: %.*s (ffmpeg id: %d)",
+	          (int)codec_len, codec_str ? codec_str : "unknown", codec_id);
+
+	// Initialize FFmpeg software decoder
+	const AVCodec *codec = avcodec_find_decoder(codec_id);
 	if (!codec) {
-		CLOG_ERROR( "H.264 codec not found");
+		CLOG_ERROR("Codec not found for id: %d", codec_id);
 		bfree(decoder);
 		context->nvdec_context = NULL;
 		return false;
@@ -85,22 +91,31 @@ software_fallback:
 
 	decoder->codec_ctx = avcodec_alloc_context3(codec);
 	if (!decoder->codec_ctx) {
-		CLOG_ERROR( "Failed to allocate codec context");
+		CLOG_ERROR("Failed to allocate codec context");
 		bfree(decoder);
 		context->nvdec_context = NULL;
 		return false;
 	}
 
+	// Set extradata if provided (AVCC format)
+	if (description && description_len > 0) {
+		decoder->codec_ctx->extradata = av_mallocz(description_len + AV_INPUT_BUFFER_PADDING_SIZE);
+		if (decoder->codec_ctx->extradata) {
+			memcpy(decoder->codec_ctx->extradata, description, description_len);
+			decoder->codec_ctx->extradata_size = description_len;
+			CLOG_INFO("Set codec extradata (%zu bytes)", description_len);
+		}
+	}
+
 	if (avcodec_open2(decoder->codec_ctx, codec, NULL) < 0) {
-		CLOG_ERROR( "Failed to open codec");
+		CLOG_ERROR("Failed to open codec");
 		avcodec_free_context(&decoder->codec_ctx);
 		bfree(decoder);
 		context->nvdec_context = NULL;
 		return false;
 	}
 
-	decoder->pix_fmt = AV_PIX_FMT_YUV420P; // Default format
-	CLOG_INFO( "FFmpeg software decoder initialized as fallback");
+	CLOG_INFO("FFmpeg software decoder initialized with codec: %s", codec->name);
 	return true;
 }
 
@@ -114,11 +129,6 @@ void nvdec_decoder_destroy(struct hang_source *context)
 	if (decoder->codec_ctx) {
 		avcodec_free_context(&decoder->codec_ctx);
 		decoder->codec_ctx = NULL;
-	}
-
-	if (decoder->hw_device_ctx) {
-		av_buffer_unref(&decoder->hw_device_ctx);
-		decoder->hw_device_ctx = NULL;
 	}
 
 	if (decoder->sws_ctx) {
@@ -138,212 +148,8 @@ bool nvdec_decoder_decode(struct hang_source *context, const uint8_t *data, size
 		return false;
 	}
 
-	// Try CUDA hardware acceleration first, fallback to software
-	if (decoder->hw_device_ctx && decoder->codec_ctx) {
-		return nvdec_decode_frame(decoder, data, size, pts, context);
-	} else if (decoder->codec_ctx) {
-		return software_decode_frame(decoder, data, size, pts, context);
-	} else {
-		return false;
-	}
+	return decode_frame(decoder, data, size, pts, context);
 }
-
-// Initialize CUDA hardware acceleration with FFmpeg
-#ifdef HAVE_NVDEC
-static bool nvdec_init_cuda_decoder(struct nvdec_decoder *decoder)
-{
-	int ret;
-
-	// Create CUDA device context
-	ret = av_hwdevice_ctx_create(&decoder->hw_device_ctx, AV_HWDEVICE_TYPE_CUDA, NULL, NULL, 0);
-	if (ret < 0) {
-		CLOG_DEBUG( "Failed to create CUDA device context: %s", av_err2str(ret));
-		return false;
-	}
-
-	// Get the codec
-	const AVCodec *codec = avcodec_find_decoder_by_name("h264_cuvid");
-	if (!codec) {
-		CLOG_DEBUG( "CUDA H.264 decoder not found, trying generic hardware decoder");
-		codec = avcodec_find_decoder(AV_CODEC_ID_H264);
-		if (!codec) {
-			CLOG_ERROR( "H.264 codec not found");
-			av_buffer_unref(&decoder->hw_device_ctx);
-			return false;
-		}
-	}
-
-	// Create codec context
-	decoder->codec_ctx = avcodec_alloc_context3(codec);
-	if (!decoder->codec_ctx) {
-		CLOG_ERROR( "Failed to allocate codec context");
-		av_buffer_unref(&decoder->hw_device_ctx);
-		return false;
-	}
-
-	// Set hardware device context
-	decoder->codec_ctx->hw_device_ctx = av_buffer_ref(decoder->hw_device_ctx);
-
-	// Configure codec for hardware acceleration
-	if (strcmp(codec->name, "h264_cuvid") == 0) {
-		// NVIDIA CUDA decoder
-		decoder->codec_ctx->extra_hw_frames = 1;
-	}
-
-	// Open the codec
-	ret = avcodec_open2(decoder->codec_ctx, codec, NULL);
-	if (ret < 0) {
-		CLOG_ERROR( "Failed to open CUDA codec: %s", av_err2str(ret));
-		avcodec_free_context(&decoder->codec_ctx);
-		av_buffer_unref(&decoder->hw_device_ctx);
-		return false;
-	}
-
-	decoder->pix_fmt = AV_PIX_FMT_CUDA; // Hardware format
-	CLOG_INFO( "CUDA hardware decoder initialized with codec: %s", codec->name);
-	return true;
-}
-#else
-// CUDA not available, always return false
-static bool nvdec_init_cuda_decoder(struct nvdec_decoder *decoder)
-{
-	UNUSED_PARAMETER(decoder);
-	return false;
-}
-#endif
-
-// Decode frame using CUDA hardware acceleration
-#ifdef HAVE_NVDEC
-static bool nvdec_decode_frame(struct nvdec_decoder *decoder, const uint8_t *data, size_t size, uint64_t pts, struct hang_source *context)
-{
-	// Convert MP4 NAL units to Annex B format
-	uint8_t *converted_data = NULL;
-	size_t converted_size = 0;
-
-	if (!convert_mp4_nal_units_to_annex_b(data, size, &converted_data, &converted_size)) {
-		CLOG_ERROR( "Failed to convert NAL units");
-		return false;
-	}
-
-	AVPacket *packet = av_packet_alloc();
-	if (!packet) {
-		CLOG_ERROR( "Failed to allocate AVPacket");
-		bfree(converted_data);
-		return false;
-	}
-
-	packet->data = converted_data;
-	packet->size = converted_size;
-	packet->pts = pts;
-
-	int ret = avcodec_send_packet(decoder->codec_ctx, packet);
-	av_packet_free(&packet);
-
-	if (ret < 0) {
-		CLOG_ERROR( "Error sending packet to CUDA decoder: %s", av_err2str(ret));
-		bfree(converted_data);
-		return false;
-	}
-
-	AVFrame *frame = av_frame_alloc();
-	if (!frame) {
-		CLOG_ERROR( "Failed to allocate AVFrame");
-		bfree(converted_data);
-		return false;
-	}
-
-	ret = avcodec_receive_frame(decoder->codec_ctx, frame);
-	if (ret < 0) {
-		if (ret != AVERROR(EAGAIN)) {
-			CLOG_ERROR( "Error receiving frame from CUDA decoder: %s", av_err2str(ret));
-		}
-		av_frame_free(&frame);
-		bfree(converted_data);
-		return false;
-	}
-
-	// Check if frame is in hardware memory
-	if (frame->format == AV_PIX_FMT_CUDA) {
-		// Transfer from GPU to CPU
-		AVFrame *sw_frame = av_frame_alloc();
-		if (!sw_frame) {
-			CLOG_ERROR( "Failed to allocate software frame");
-			av_frame_free(&frame);
-			bfree(converted_data);
-			return false;
-		}
-
-		sw_frame->format = AV_PIX_FMT_NV12; // Intermediate format
-		ret = av_hwframe_transfer_data(sw_frame, frame, 0);
-		av_frame_free(&frame);
-		frame = sw_frame;
-
-		if (ret < 0) {
-			CLOG_ERROR( "Failed to transfer frame from GPU to CPU: %s", av_err2str(ret));
-			av_frame_free(&frame);
-			bfree(converted_data);
-			return false;
-		}
-	}
-
-	// Convert to RGBA for OBS
-	if (!decoder->sws_ctx) {
-		decoder->sws_ctx = sws_getContext(
-			frame->width, frame->height, (enum AVPixelFormat)frame->format,
-			frame->width, frame->height, AV_PIX_FMT_RGBA,
-			SWS_BILINEAR | SWS_FULL_CHR_H_INP | SWS_FULL_CHR_H_INT, NULL, NULL, NULL);
-		if (!decoder->sws_ctx) {
-			CLOG_ERROR( "Failed to create SWS context");
-			av_frame_free(&frame);
-			bfree(converted_data);
-			return false;
-		}
-	}
-
-	// Allocate buffer for RGBA data
-	size_t rgba_size = frame->width * frame->height * 4;
-	uint8_t *rgba_data = bzalloc(rgba_size);
-	if (!rgba_data) {
-		CLOG_ERROR( "Failed to allocate RGBA buffer");
-		av_frame_free(&frame);
-		bfree(converted_data);
-		return false;
-	}
-
-	// Convert frame to RGBA
-	uint8_t *dst_data[4] = {rgba_data, NULL, NULL, NULL};
-	int dst_linesize[4] = {frame->width * 4, 0, 0, 0};
-
-	int scale_ret = sws_scale(decoder->sws_ctx, (const uint8_t * const *)frame->data, frame->linesize,
-	          0, frame->height, dst_data, dst_linesize);
-
-	if (scale_ret < 0) {
-		CLOG_ERROR( "sws_scale failed: %s", av_err2str(ret));
-		bfree(rgba_data);
-		av_frame_free(&frame);
-		bfree(converted_data);
-		return false;
-	}
-
-	// Store the decoded frame
-	store_decoded_frame(context, rgba_data, rgba_size, frame->width, frame->height);
-
-	av_frame_free(&frame);
-	bfree(converted_data);
-	return true;
-}
-#else
-// CUDA not available, fallback to software decoding
-static bool nvdec_decode_frame(struct nvdec_decoder *decoder, const uint8_t *data, size_t size, uint64_t pts, struct hang_source *context)
-{
-	UNUSED_PARAMETER(decoder);
-	UNUSED_PARAMETER(data);
-	UNUSED_PARAMETER(size);
-	UNUSED_PARAMETER(pts);
-	UNUSED_PARAMETER(context);
-	return false;
-}
-#endif
 
 static bool convert_mp4_nal_units_to_annex_b(const uint8_t *data, size_t size, uint8_t **out_data, size_t *out_size)
 {
@@ -396,15 +202,14 @@ static bool convert_mp4_nal_units_to_annex_b(const uint8_t *data, size_t size, u
 	return true;
 }
 
-static bool software_decode_frame(struct nvdec_decoder *decoder, const uint8_t *data, size_t size, uint64_t pts, struct hang_source *context)
+static bool decode_frame(struct nvdec_decoder *decoder, const uint8_t *data, size_t size, uint64_t pts, struct hang_source *context)
 {
-
 	// For MP4 H.264 (avc1), convert length-prefixed NAL units to start-code format
 	uint8_t *converted_data = NULL;
 	size_t converted_size = 0;
 
 	if (!convert_mp4_nal_units_to_annex_b(data, size, &converted_data, &converted_size)) {
-		CLOG_ERROR( "Failed to convert NAL units");
+		CLOG_ERROR( "Failed to convert NAL units: size=%zu", size);
 		return false;
 	}
 
@@ -421,105 +226,182 @@ static bool software_decode_frame(struct nvdec_decoder *decoder, const uint8_t *
 
 	int ret = avcodec_send_packet(decoder->codec_ctx, packet);
 	av_packet_free(&packet);
-	packet = NULL; // Set to NULL after freeing to prevent double free
 
 	if (ret < 0) {
-		CLOG_ERROR( "Error sending packet to decoder: %s", av_err2str(ret));
+		CLOG_ERROR( "Error sending packet to decoder: %s (ret=%d)", av_err2str(ret), ret);
 		bfree(converted_data);
 		return false;
 	}
 
-	AVFrame *frame = av_frame_alloc();
-	if (!frame) {
-		CLOG_ERROR( "Failed to allocate AVFrame");
-		bfree(converted_data);
-		return false;
-	}
-
-	ret = avcodec_receive_frame(decoder->codec_ctx, frame);
-	if (ret < 0) {
-		if (ret != AVERROR(EAGAIN)) {
-			CLOG_ERROR( "Error receiving frame from decoder: %s", av_err2str(ret));
+	// CRITICAL: Drain ALL frames from the decoder, not just one
+	// FFmpeg decoders can buffer multiple frames, and if we don't drain them,
+	// frames will accumulate and cause memory issues/crashes
+	int frames_decoded_this_packet = 0;
+	bool success = false;
+	
+	while (true) {
+		AVFrame *frame = av_frame_alloc();
+		if (!frame) {
+			CLOG_ERROR( "Failed to allocate AVFrame");
+			break;
 		}
-		av_frame_free(&frame);
-		bfree(converted_data);
-		return false;
-	}
 
-	// Convert frame to RGBA for OBS
-	if (!decoder->sws_ctx) {
-		decoder->sws_ctx = sws_getContext(
-			frame->width, frame->height, (enum AVPixelFormat)frame->format,
-			frame->width, frame->height, AV_PIX_FMT_RGBA,
-			SWS_BILINEAR | SWS_FULL_CHR_H_INP | SWS_FULL_CHR_H_INT, NULL, NULL, NULL);
+		ret = avcodec_receive_frame(decoder->codec_ctx, frame);
+		if (ret < 0) {
+			if (ret == AVERROR(EAGAIN)) {
+				// No more frames available right now - this is normal
+				av_frame_free(&frame);
+				break;
+			} else if (ret == AVERROR_EOF) {
+				// End of stream
+				av_frame_free(&frame);
+				break;
+			} else {
+				CLOG_ERROR( "Error receiving frame from decoder: %s (ret=%d)", av_err2str(ret), ret);
+				av_frame_free(&frame);
+				break;
+			}
+		}
+
+		frames_decoded_this_packet++;
+		success = true;
+
+		// Convert frame to RGBA for OBS
 		if (!decoder->sws_ctx) {
-			CLOG_ERROR( "Failed to create SWS context");
-			av_frame_free(&frame);
-			return false;
+			decoder->sws_ctx = sws_getContext(
+				frame->width, frame->height, (enum AVPixelFormat)frame->format,
+				frame->width, frame->height, AV_PIX_FMT_RGBA,
+				SWS_BILINEAR | SWS_FULL_CHR_H_INP | SWS_FULL_CHR_H_INT, NULL, NULL, NULL);
+			if (!decoder->sws_ctx) {
+				CLOG_ERROR( "Failed to create SWS context");
+				av_frame_free(&frame);
+				break;
+			}
 		}
-	}
 
-	// Allocate buffer for RGBA data
-	size_t rgba_size = frame->width * frame->height * 4; // 4 bytes per pixel for RGBA
-	uint8_t *rgba_data = bzalloc(rgba_size);
-	if (!rgba_data) {
-		CLOG_ERROR( "Failed to allocate RGBA buffer");
+		// Allocate buffer for RGBA data
+		size_t rgba_size = frame->width * frame->height * 4; // 4 bytes per pixel for RGBA
+		uint8_t *rgba_data = bzalloc(rgba_size);
+		if (!rgba_data) {
+			CLOG_ERROR( "Failed to allocate RGBA buffer: size=%zu", rgba_size);
+			av_frame_free(&frame);
+			break;
+		}
+
+		// Convert frame to RGBA
+		uint8_t *dst_data[4] = {rgba_data, NULL, NULL, NULL};
+		int dst_linesize[4] = {frame->width * 4, 0, 0, 0};
+
+		int scale_ret = sws_scale(decoder->sws_ctx, (const uint8_t * const *)frame->data, frame->linesize,
+		          0, frame->height, dst_data, dst_linesize);
+
+		if (scale_ret < 0) {
+			CLOG_ERROR( "sws_scale failed: %s (ret=%d)", av_err2str(scale_ret), scale_ret);
+			bfree(rgba_data);
+			av_frame_free(&frame);
+			break;
+		}
+
+		// Use frame PTS if available, otherwise use packet PTS
+		uint64_t frame_pts = frame->pts != AV_NOPTS_VALUE ? frame->pts : pts;
+		
+		// Validate frame data before output
+		if (!rgba_data || frame->width == 0 || frame->height == 0) {
+			CLOG_ERROR("Invalid frame data before output: rgba_data=%p width=%d height=%d",
+			           rgba_data, frame->width, frame->height);
+			bfree(rgba_data);
+			av_frame_free(&frame);
+			break;
+		}
+		
+		// Output the decoded frame to OBS
+		output_decoded_frame(context, rgba_data, frame->width, frame->height, frame_pts);
+
 		av_frame_free(&frame);
-		bfree(converted_data);
-		return false;
 	}
 
-	// Convert frame to RGBA
-	uint8_t *dst_data[4] = {rgba_data, NULL, NULL, NULL};
-	int dst_linesize[4] = {frame->width * 4, 0, 0, 0};
-
-	int scale_ret = sws_scale(decoder->sws_ctx, (const uint8_t * const *)frame->data, frame->linesize,
-	          0, frame->height, dst_data, dst_linesize);
-
-	if (scale_ret < 0) {
-		CLOG_ERROR( "sws_scale failed: %s", av_err2str(ret));
-		bfree(rgba_data);
-		av_frame_free(&frame);
-		bfree(converted_data);
-		return false;
-	}
-
-	// Store the decoded frame
-	store_decoded_frame(context, rgba_data, rgba_size, frame->width, frame->height);
-
-	av_frame_free(&frame);
 	bfree(converted_data);
-	return true;
+	return success;
 }
 
-static void store_decoded_frame(struct hang_source *context, uint8_t *data, size_t size, uint32_t width, uint32_t height)
+static void output_decoded_frame(struct hang_source *context, uint8_t *data, uint32_t width, uint32_t height, uint64_t pts_us)
 {
+	// IMPORTANT: This function is called while decoder_mutex is held.
+	// We must ALWAYS unlock before returning to avoid deadlocks.
+	// The caller (on_video_frame) expects the mutex to be unlocked after this returns.
+	
 	if (!context || !data) {
+		if (data) {
+			bfree(data);
+		}
+		// Unlock mutex before returning
+		if (context) {
+			pthread_mutex_unlock(&context->decoder_mutex);
+		}
+		return;
+	}
+	
+	// Validate frame dimensions
+	if (width == 0 || height == 0 || width > 7680 || height > 4320) {
+		CLOG_ERROR("Invalid frame dimensions: %ux%u", width, height);
+		bfree(data);
+		pthread_mutex_unlock(&context->decoder_mutex);
 		return;
 	}
 
+	// Copy all values we need while holding decoder_mutex to avoid race conditions
+	bool is_active = context->active;
+	obs_source_t *source = context->source;
+	
+	// Use PTS-based timestamps to ensure frames are displayed at the correct rate
+	// PTS is in microseconds, convert to nanoseconds for OBS
+	// This prevents OBS from accumulating frames when they arrive faster than display rate
+	uint64_t obs_timestamp_ns = pts_us * 1000ULL;  // Convert microseconds to nanoseconds
+	
+	// Track first frame to establish baseline and ensure monotonic timestamps
 	pthread_mutex_lock(&context->frame_mutex);
-
-	// Check if source is still active before storing frame
-	// This prevents storing frames after deactivation has started cleanup
-	if (!context->active) {
-		pthread_mutex_unlock(&context->frame_mutex);
-		bfree(data); // Free the data we allocated since we're not using it
+	if (!context->has_first_frame) {
+		context->has_first_frame = true;
+		context->first_frame_pts_us = pts_us;
+		context->first_frame_obs_time_ns = os_gettime_ns();
+		context->last_output_timestamp_ns = obs_timestamp_ns;
+	} else {
+		// Ensure timestamps are monotonically increasing
+		// If PTS goes backwards (shouldn't happen but be defensive), adjust it
+		if (obs_timestamp_ns <= context->last_output_timestamp_ns) {
+			obs_timestamp_ns = context->last_output_timestamp_ns + 1;
+		}
+		context->last_output_timestamp_ns = obs_timestamp_ns;
+	}
+	pthread_mutex_unlock(&context->frame_mutex);
+	
+	// Now unlock decoder_mutex BEFORE calling OBS API to avoid deadlocks
+	pthread_mutex_unlock(&context->decoder_mutex);
+	
+	// Check if source is still active after unlocking
+	if (!is_active || !source) {
+		bfree(data);
 		return;
 	}
 
-	// Free previous frame data
-	if (context->current_frame_data) {
-		bfree(context->current_frame_data);
+	// Output frame to OBS using async video API
+	// This is required for OBS_SOURCE_ASYNC_VIDEO sources
+	struct obs_source_frame obs_frame = {0};
+	obs_frame.data[0] = data;
+	obs_frame.linesize[0] = width * 4;  // RGBA = 4 bytes per pixel
+	obs_frame.width = width;
+	obs_frame.height = height;
+	obs_frame.format = VIDEO_FORMAT_RGBA;
+	obs_frame.timestamp = obs_timestamp_ns;
+	obs_frame.full_range = true;  // Set full range flag
+
+	// Use the saved source pointer (copied while mutex was held)
+	// OBS source pointers are stable and won't be freed until the source is destroyed,
+	// and OBS will handle source destruction gracefully
+	if (source && is_active) {
+		obs_source_output_video(source, &obs_frame);
 	}
 
-	// Store new frame data
-	context->current_frame_data = data;
-	context->current_frame_size = size;
-	context->current_frame_width = width;
-	context->current_frame_height = height;
-
-	pthread_mutex_unlock(&context->frame_mutex);
+	// OBS internally copies the frame data synchronously, so we can free our copy now
+	bfree(data);
 }
-
-
