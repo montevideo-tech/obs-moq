@@ -40,6 +40,7 @@ class MoQOutput
     int connect_time_ms;
     std::chrono::steady_clock::time_point connect_start;
 
+    int origin;
     int session;
     int broadcast;
     int video;
