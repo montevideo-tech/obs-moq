@@ -232,7 +232,7 @@ void MoQOutput::VideoInit()
 	}
 
 	const char *codec = obs_encoder_get_codec(encoder);
-	video = moq_publish_media_init(broadcast, codec, strlen(codec), extra_data, extra_size);
+	video = moq_publish_media_ordered(broadcast, codec, strlen(codec), extra_data, extra_size);
 	if (video < 0) {
 		LOG_ERROR("Failed to initialize video track: %d", video);
 		return;
@@ -270,7 +270,7 @@ void MoQOutput::AudioInit()
 	}
 
 	const char *codec = obs_encoder_get_codec(encoder);
-	audio = moq_publish_media_init(broadcast, codec, strlen(codec), extra_data, extra_size);
+	audio = moq_publish_media_ordered(broadcast, codec, strlen(codec), extra_data, extra_size);
 	if (audio < 0) {
 		LOG_ERROR("Failed to initialize audio track: %d", audio);
 		return;

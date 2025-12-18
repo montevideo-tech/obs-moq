@@ -121,6 +121,9 @@ static void hang_source_update(void *data, obs_data_t *settings)
 	const char *broadcast = obs_data_get_string(settings, "broadcast");
 
 	bool changed = false;
+	bool should_reconnect = false;
+
+	pthread_mutex_lock(&ctx->mutex);
 
 	if (!ctx->url || strcmp(ctx->url, url) != 0) {
 		bfree(ctx->url);
@@ -135,6 +138,12 @@ static void hang_source_update(void *data, obs_data_t *settings)
 	}
 
 	if (changed && ctx->url && ctx->broadcast && strlen(ctx->url) > 0 && strlen(ctx->broadcast) > 0) {
+		should_reconnect = true;
+	}
+
+	pthread_mutex_unlock(&ctx->mutex);
+
+	if (should_reconnect) {
 		hang_source_reconnect(ctx);
 	}
 }
@@ -161,25 +170,26 @@ static obs_properties_t *hang_source_properties(void *data)
 // via obs_source_output_video(). No video_tick or video_render callbacks needed.
 
 // Forward declaration for use in callback
-static void hang_source_start_consume(struct hang_source *ctx);
+static void hang_source_start_consume(struct hang_source *ctx, uint32_t expected_gen);
 
 // MoQ callback implementations
 static void on_session_status(void *user_data, int32_t code)
 {
 	struct hang_source *ctx = (struct hang_source *)user_data;
 
-	// Check if we've been disconnected
+	// Check if we've been disconnected and capture generation
 	pthread_mutex_lock(&ctx->mutex);
 	if (ctx->session < 0) {
 		pthread_mutex_unlock(&ctx->mutex);
 		return;
 	}
+	uint32_t current_gen = ctx->generation;
 	pthread_mutex_unlock(&ctx->mutex);
 
 	if (code == 0) {
-		LOG_INFO("MoQ session connected successfully");
+		LOG_INFO("MoQ session connected successfully (generation %u)", current_gen);
 		// Now that we're connected, start consuming the broadcast
-		hang_source_start_consume(ctx);
+		hang_source_start_consume(ctx, current_gen);
 	} else {
 		LOG_ERROR("MoQ session failed with code: %d", code);
 	}
@@ -226,8 +236,8 @@ static void on_catalog(void *user_data, int32_t catalog)
 	}
 
 	// Subscribe to video track with minimal buffering
-	// Note: moq_consume_video_track takes the catalog handle, not the consume handle
-	int32_t track = moq_consume_video_track(catalog, 0, 0, on_video_frame, ctx);
+	// Note: moq_consume_video_ordered takes the catalog handle, not the consume handle
+	int32_t track = moq_consume_video_ordered(catalog, 0, 0, on_video_frame, ctx);
 	if (track < 0) {
 		LOG_ERROR("Failed to subscribe to video track: %d", track);
 		moq_consume_catalog_close(catalog);
@@ -241,7 +251,7 @@ static void on_catalog(void *user_data, int32_t catalog)
 	} else {
 		// Generation changed while we were setting up, clean up the track
 		pthread_mutex_unlock(&ctx->mutex);
-		moq_consume_video_track_close(track);
+		moq_consume_video_close(track);
 		moq_consume_catalog_close(catalog);
 		return;
 	}
@@ -275,56 +285,89 @@ static void on_video_frame(void *user_data, int32_t frame_id)
 // Helper function implementations
 static void hang_source_reconnect(struct hang_source *ctx)
 {
-	LOG_INFO("Reconnecting (generation %u -> %u)", ctx->generation, ctx->generation + 1);
-
 	// Increment generation to invalidate old callbacks
 	pthread_mutex_lock(&ctx->mutex);
-	ctx->generation++;
+	uint32_t new_gen = ctx->generation + 1;
+	LOG_INFO("Reconnecting (generation %u -> %u)", ctx->generation, new_gen);
+	ctx->generation = new_gen;
 	hang_source_disconnect_locked(ctx);
+
+	// Copy URL while holding mutex for thread safety
+	char *url_copy = bstrdup(ctx->url);
 	pthread_mutex_unlock(&ctx->mutex);
 
-	// Create origin for consuming
-	ctx->origin = moq_origin_create();
-	if (ctx->origin < 0) {
-		LOG_ERROR("Failed to create origin: %d", ctx->origin);
+	// Create origin for consuming (outside mutex since it may block)
+	int32_t new_origin = moq_origin_create();
+	if (new_origin < 0) {
+		LOG_ERROR("Failed to create origin: %d", new_origin);
+		bfree(url_copy);
 		return;
 	}
 
 	// Connect to MoQ server (consume will happen in on_session_status callback)
-	ctx->session = moq_session_connect(
-		ctx->url, strlen(ctx->url),
+	int32_t new_session = moq_session_connect(
+		url_copy, strlen(url_copy),
 		0, // origin_publish
-		ctx->origin, // origin_consume
+		new_origin, // origin_consume
 		on_session_status, ctx
 	);
+	bfree(url_copy);
 
-	if (ctx->session < 0) {
-		LOG_ERROR("Failed to connect to MoQ server: %d", ctx->session);
+	if (new_session < 0) {
+		LOG_ERROR("Failed to connect to MoQ server: %d", new_session);
+		moq_origin_close(new_origin);
 		return;
 	}
 
-	LOG_INFO("Connecting to MoQ server: %s", ctx->url);
+	// Now update ctx with the new handles, checking if generation changed
+	pthread_mutex_lock(&ctx->mutex);
+	if (ctx->generation != new_gen) {
+		// Another reconnect happened while we were creating origin/session
+		// Clean up our newly created resources
+		pthread_mutex_unlock(&ctx->mutex);
+		LOG_INFO("Generation changed during reconnect setup, cleaning up stale resources");
+		moq_session_close(new_session);
+		moq_origin_close(new_origin);
+		return;
+	}
+	ctx->origin = new_origin;
+	ctx->session = new_session;
+	LOG_INFO("Connecting to MoQ server (generation %u)", new_gen);
+	pthread_mutex_unlock(&ctx->mutex);
 }
 
 // Called after session is connected successfully
-static void hang_source_start_consume(struct hang_source *ctx)
+static void hang_source_start_consume(struct hang_source *ctx, uint32_t expected_gen)
 {
-	// Check if origin is still valid
+	// Check if origin is still valid and generation matches
 	pthread_mutex_lock(&ctx->mutex);
-	if (ctx->origin < 0) {
+	if (ctx->origin < 0 || ctx->generation != expected_gen) {
 		pthread_mutex_unlock(&ctx->mutex);
+		LOG_INFO("Skipping stale consume (generation mismatch or invalid origin)");
 		return;
 	}
+	// Capture values while holding mutex
+	int32_t origin = ctx->origin;
+	char *broadcast_copy = bstrdup(ctx->broadcast);
 	pthread_mutex_unlock(&ctx->mutex);
 
 	// Consume broadcast by path
-	int32_t consume = moq_origin_consume(ctx->origin, ctx->broadcast, strlen(ctx->broadcast));
+	int32_t consume = moq_origin_consume(origin, broadcast_copy, strlen(broadcast_copy));
 	if (consume < 0) {
 		LOG_ERROR("Failed to consume broadcast: %d", consume);
+		bfree(broadcast_copy);
 		return;
 	}
 
 	pthread_mutex_lock(&ctx->mutex);
+	// Verify generation hasn't changed while we were waiting
+	if (ctx->generation != expected_gen) {
+		pthread_mutex_unlock(&ctx->mutex);
+		LOG_INFO("Generation changed during consume setup, cleaning up");
+		moq_consume_close(consume);
+		bfree(broadcast_copy);
+		return;
+	}
 	ctx->consume = consume;
 	pthread_mutex_unlock(&ctx->mutex);
 
@@ -332,17 +375,19 @@ static void hang_source_start_consume(struct hang_source *ctx)
 	int32_t catalog_handle = moq_consume_catalog(consume, on_catalog, ctx);
 	if (catalog_handle < 0) {
 		LOG_ERROR("Failed to subscribe to catalog: %d", catalog_handle);
+		bfree(broadcast_copy);
 		return;
 	}
 
-	LOG_INFO("Consuming broadcast: %s", ctx->broadcast);
+	LOG_INFO("Consuming broadcast: %s", broadcast_copy);
+	bfree(broadcast_copy);
 }
 
 // NOTE: Caller must hold ctx->mutex when calling this function
 static void hang_source_disconnect_locked(struct hang_source *ctx)
 {
 	if (ctx->video_track >= 0) {
-		moq_consume_video_track_close(ctx->video_track);
+		moq_consume_video_close(ctx->video_track);
 		ctx->video_track = -1;
 	}
 
