@@ -30,8 +30,12 @@ struct hang_source {
 	uint64_t settings_changed_time;  // Timestamp when settings last changed
 	bool reconnect_pending;          // True if we need to reconnect after debounce
 
+	// Shutdown flag - set when destroy begins, callbacks should exit early
+	volatile bool shutting_down;
+
 	// Session handles (all negative = invalid)
 	volatile uint32_t generation;  // Increments on reconnect
+	bool reconnect_in_progress;    // True while reconnect is happening
 	int32_t origin;
 	int32_t session;
 	int32_t consume;
@@ -43,6 +47,7 @@ struct hang_source {
 	struct SwsContext *sws_ctx;
 	bool got_keyframe;
 	uint32_t frames_waiting_for_keyframe;  // Count of skipped frames while waiting
+	uint32_t consecutive_decode_errors;    // Count of consecutive decode failures
 
 	// Output frame buffer
 	struct obs_source_frame frame;
@@ -86,8 +91,12 @@ static void *hang_source_create(obs_data_t *settings, obs_source_t *source)
 	ctx->settings_changed_time = 0;
 	ctx->reconnect_pending = false;
 
+	// Initialize shutdown flag
+	ctx->shutting_down = false;
+
 	// Initialize handles to invalid values
 	ctx->generation = 0;
+	ctx->reconnect_in_progress = false;
 	ctx->origin = -1;
 	ctx->session = -1;
 	ctx->consume = -1;
@@ -99,6 +108,7 @@ static void *hang_source_create(obs_data_t *settings, obs_source_t *source)
 	ctx->sws_ctx = NULL;
 	ctx->got_keyframe = false;
 	ctx->frames_waiting_for_keyframe = 0;
+	ctx->consecutive_decode_errors = 0;
 	ctx->frame_buffer = NULL;
 
 	// Initialize threading
@@ -119,9 +129,15 @@ static void hang_source_destroy(void *data)
 {
 	struct hang_source *ctx = (struct hang_source *)data;
 
+	// Set shutdown flag first - callbacks will check this and exit early
 	pthread_mutex_lock(&ctx->mutex);
+	ctx->shutting_down = true;
 	hang_source_disconnect_locked(ctx);
 	pthread_mutex_unlock(&ctx->mutex);
+
+	// Give MoQ callbacks time to drain - they check shutting_down and exit early
+	// This prevents use-after-free when async callbacks fire after ctx is freed
+	os_sleep_ms(100);
 
 	bfree(ctx->url);
 	bfree(ctx->broadcast);
@@ -196,6 +212,12 @@ static void hang_source_video_tick(void *data, float seconds)
 
 	pthread_mutex_lock(&ctx->mutex);
 
+	// Don't process during shutdown
+	if (ctx->shutting_down) {
+		pthread_mutex_unlock(&ctx->mutex);
+		return;
+	}
+
 	if (!ctx->reconnect_pending) {
 		pthread_mutex_unlock(&ctx->mutex);
 		return;
@@ -260,22 +282,41 @@ static void on_session_status(void *user_data, int32_t code)
 {
 	struct hang_source *ctx = (struct hang_source *)user_data;
 
-	// Check if we've been disconnected and capture generation
+	// Check if we're shutting down - exit early to avoid use-after-free
 	pthread_mutex_lock(&ctx->mutex);
+	if (ctx->shutting_down) {
+		LOG_DEBUG("Ignoring session status callback - shutting down");
+		pthread_mutex_unlock(&ctx->mutex);
+		return;
+	}
 	if (ctx->session < 0) {
+		LOG_DEBUG("Ignoring session status callback - already disconnected");
 		pthread_mutex_unlock(&ctx->mutex);
 		return;
 	}
 	uint32_t current_gen = ctx->generation;
-	pthread_mutex_unlock(&ctx->mutex);
-
+	
 	if (code == 0) {
+		pthread_mutex_unlock(&ctx->mutex);
 		LOG_INFO("MoQ session connected successfully (generation %u)", current_gen);
 		// Now that we're connected, start consuming the broadcast
 		hang_source_start_consume(ctx, current_gen);
 	} else {
-		LOG_ERROR("MoQ session failed with code: %d", code);
-		// Connection failed - blank the video to show error state
+		// Connection failed - clean up the session and origin immediately
+		LOG_ERROR("MoQ session failed with code: %d (generation %u)", code, current_gen);
+		
+		// Clean up failed session/origin to prevent further callbacks
+		if (ctx->session >= 0) {
+			moq_session_close(ctx->session);
+			ctx->session = -1;
+		}
+		if (ctx->origin >= 0) {
+			moq_origin_close(ctx->origin);
+			ctx->origin = -1;
+		}
+		pthread_mutex_unlock(&ctx->mutex);
+		
+		// Blank the video to show error state
 		hang_source_blank_video(ctx);
 	}
 }
@@ -287,6 +328,15 @@ static void on_catalog(void *user_data, int32_t catalog)
 	LOG_INFO("Catalog callback received: %d", catalog);
 
 	pthread_mutex_lock(&ctx->mutex);
+
+	// Check if we're shutting down - exit early to avoid use-after-free
+	if (ctx->shutting_down) {
+		LOG_DEBUG("Ignoring catalog callback - shutting down");
+		pthread_mutex_unlock(&ctx->mutex);
+		if (catalog >= 0)
+			moq_consume_catalog_close(catalog);
+		return;
+	}
 
 	// Check if this callback is still valid (not from a stale connection)
 	uint32_t current_gen = ctx->generation;
@@ -360,6 +410,12 @@ static void on_video_frame(void *user_data, int32_t frame_id)
 	// Note: We can't check video_track here because frames may arrive before
 	// the track handle is stored in on_catalog (race condition)
 	pthread_mutex_lock(&ctx->mutex);
+	// Check if we're shutting down - exit early to avoid use-after-free
+	if (ctx->shutting_down) {
+		pthread_mutex_unlock(&ctx->mutex);
+		moq_consume_frame_close(frame_id);
+		return;
+	}
 	if (ctx->consume < 0) {
 		// We've been disconnected, ignore this callback
 		pthread_mutex_unlock(&ctx->mutex);
@@ -376,6 +432,15 @@ static void hang_source_reconnect(struct hang_source *ctx)
 {
 	// Increment generation to invalidate old callbacks
 	pthread_mutex_lock(&ctx->mutex);
+	
+	// Check if reconnect is already in progress
+	if (ctx->reconnect_in_progress) {
+		LOG_DEBUG("Reconnect already in progress, skipping");
+		pthread_mutex_unlock(&ctx->mutex);
+		return;
+	}
+	
+	ctx->reconnect_in_progress = true;
 	uint32_t new_gen = ctx->generation + 1;
 	LOG_INFO("Reconnecting (generation %u -> %u)", ctx->generation, new_gen);
 	ctx->generation = new_gen;
@@ -388,12 +453,17 @@ static void hang_source_reconnect(struct hang_source *ctx)
 	// Blank video while reconnecting to avoid showing stale frames
 	hang_source_blank_video(ctx);
 
+	// Small delay to allow MoQ library to fully clean up previous connection
+	os_sleep_ms(50);
+
 	// Create origin for consuming (outside mutex since it may block)
 	int32_t new_origin = moq_origin_create();
 	if (new_origin < 0) {
 		LOG_ERROR("Failed to create origin: %d", new_origin);
 		bfree(url_copy);
-		// Video already blanked at start of reconnect
+		pthread_mutex_lock(&ctx->mutex);
+		ctx->reconnect_in_progress = false;
+		pthread_mutex_unlock(&ctx->mutex);
 		return;
 	}
 
@@ -409,7 +479,9 @@ static void hang_source_reconnect(struct hang_source *ctx)
 	if (new_session < 0) {
 		LOG_ERROR("Failed to connect to MoQ server: %d", new_session);
 		moq_origin_close(new_origin);
-		// Video already blanked at start of reconnect
+		pthread_mutex_lock(&ctx->mutex);
+		ctx->reconnect_in_progress = false;
+		pthread_mutex_unlock(&ctx->mutex);
 		return;
 	}
 
@@ -418,6 +490,7 @@ static void hang_source_reconnect(struct hang_source *ctx)
 	if (ctx->generation != new_gen) {
 		// Another reconnect happened while we were creating origin/session
 		// Clean up our newly created resources
+		ctx->reconnect_in_progress = false;
 		pthread_mutex_unlock(&ctx->mutex);
 		LOG_INFO("Generation changed during reconnect setup, cleaning up stale resources");
 		moq_session_close(new_session);
@@ -426,6 +499,7 @@ static void hang_source_reconnect(struct hang_source *ctx)
 	}
 	ctx->origin = new_origin;
 	ctx->session = new_session;
+	ctx->reconnect_in_progress = false;
 	LOG_INFO("Connecting to MoQ server (generation %u)", new_gen);
 	pthread_mutex_unlock(&ctx->mutex);
 }
@@ -448,9 +522,21 @@ static void hang_source_start_consume(struct hang_source *ctx, uint32_t expected
 	// Consume broadcast by path
 	int32_t consume = moq_origin_consume(origin, broadcast_copy, strlen(broadcast_copy));
 	if (consume < 0) {
-		LOG_ERROR("Failed to consume broadcast: %d", consume);
+		LOG_ERROR("Failed to consume broadcast '%s': %d", broadcast_copy, consume);
 		bfree(broadcast_copy);
-		// Failed to consume (invalid broadcast path) - blank video
+		// Failed to consume - clean up session/origin
+		pthread_mutex_lock(&ctx->mutex);
+		if (ctx->generation == expected_gen) {
+			if (ctx->session >= 0) {
+				moq_session_close(ctx->session);
+				ctx->session = -1;
+			}
+			if (ctx->origin >= 0) {
+				moq_origin_close(ctx->origin);
+				ctx->origin = -1;
+			}
+		}
+		pthread_mutex_unlock(&ctx->mutex);
 		hang_source_blank_video(ctx);
 		return;
 	}
@@ -470,9 +556,25 @@ static void hang_source_start_consume(struct hang_source *ctx, uint32_t expected
 	// Subscribe to catalog updates
 	int32_t catalog_handle = moq_consume_catalog(consume, on_catalog, ctx);
 	if (catalog_handle < 0) {
-		LOG_ERROR("Failed to subscribe to catalog: %d", catalog_handle);
+		LOG_ERROR("Failed to subscribe to catalog for '%s': %d", broadcast_copy, catalog_handle);
 		bfree(broadcast_copy);
-		// Failed to get catalog - blank video
+		// Failed to get catalog - clean up
+		pthread_mutex_lock(&ctx->mutex);
+		if (ctx->generation == expected_gen) {
+			if (ctx->consume >= 0) {
+				moq_consume_close(ctx->consume);
+				ctx->consume = -1;
+			}
+			if (ctx->session >= 0) {
+				moq_session_close(ctx->session);
+				ctx->session = -1;
+			}
+			if (ctx->origin >= 0) {
+				moq_origin_close(ctx->origin);
+				ctx->origin = -1;
+			}
+		}
+		pthread_mutex_unlock(&ctx->mutex);
 		hang_source_blank_video(ctx);
 		return;
 	}
@@ -512,6 +614,7 @@ static void hang_source_disconnect_locked(struct hang_source *ctx)
 	hang_source_destroy_decoder_locked(ctx);
 	ctx->got_keyframe = false;
 	ctx->frames_waiting_for_keyframe = 0;
+	ctx->consecutive_decode_errors = 0;
 }
 
 // Blanks the video preview by outputting a NULL frame
@@ -616,6 +719,7 @@ static bool hang_source_init_decoder(struct hang_source *ctx, const struct moq_v
 	ctx->frame.timestamp = 0;
 	ctx->got_keyframe = false;
 	ctx->frames_waiting_for_keyframe = 0;
+	ctx->consecutive_decode_errors = 0;
 
 	pthread_mutex_unlock(&ctx->mutex);
 
@@ -646,6 +750,13 @@ static void hang_source_destroy_decoder_locked(struct hang_source *ctx)
 static void hang_source_decode_frame(struct hang_source *ctx, int32_t frame_id)
 {
 	pthread_mutex_lock(&ctx->mutex);
+
+	// Check if we're shutting down - exit early to avoid use-after-free
+	if (ctx->shutting_down) {
+		pthread_mutex_unlock(&ctx->mutex);
+		moq_consume_frame_close(frame_id);
+		return;
+	}
 
 	// Check if decoder is still valid (may have been destroyed during reconnect)
 	if (!ctx->codec_ctx || !ctx->sws_ctx || !ctx->frame_buffer) {
@@ -681,9 +792,12 @@ static void hang_source_decode_frame(struct hang_source *ctx, int32_t frame_id)
 		if (!ctx->got_keyframe) {
 			LOG_INFO("Got keyframe after waiting for %u frames, payload_size=%zu", 
 			         ctx->frames_waiting_for_keyframe, frame_data.payload_size);
+			// Flush decoder to ensure clean state when starting from keyframe
+			avcodec_flush_buffers(ctx->codec_ctx);
 		}
 		ctx->got_keyframe = true;
 		ctx->frames_waiting_for_keyframe = 0;
+		ctx->consecutive_decode_errors = 0;
 	}
 
 	// Create AVPacket from frame data
@@ -705,9 +819,20 @@ static void hang_source_decode_frame(struct hang_source *ctx, int32_t frame_id)
 
 	if (ret < 0) {
 		if (ret != AVERROR(EAGAIN)) {
+			ctx->consecutive_decode_errors++;
 			char errbuf[AV_ERROR_MAX_STRING_SIZE];
 			av_strerror(ret, errbuf, sizeof(errbuf));
-			LOG_ERROR("Error sending packet to decoder: %s", errbuf);
+			
+			// If too many consecutive errors, flush decoder and wait for next keyframe
+			if (ctx->consecutive_decode_errors >= 5) {
+				LOG_WARNING("Too many send errors (%u), flushing decoder and waiting for keyframe", 
+				            ctx->consecutive_decode_errors);
+				avcodec_flush_buffers(ctx->codec_ctx);
+				ctx->got_keyframe = false;
+				ctx->consecutive_decode_errors = 0;
+			} else if (ctx->consecutive_decode_errors == 1) {
+				LOG_ERROR("Error sending packet to decoder: %s", errbuf);
+			}
 		}
 		pthread_mutex_unlock(&ctx->mutex);
 		moq_consume_frame_close(frame_id);
@@ -725,15 +850,30 @@ static void hang_source_decode_frame(struct hang_source *ctx, int32_t frame_id)
 	ret = avcodec_receive_frame(ctx->codec_ctx, frame);
 	if (ret < 0) {
 		if (ret != AVERROR(EAGAIN)) {
+			ctx->consecutive_decode_errors++;
 			char errbuf[AV_ERROR_MAX_STRING_SIZE];
 			av_strerror(ret, errbuf, sizeof(errbuf));
-			LOG_ERROR("Error receiving frame from decoder: %s", errbuf);
+			
+			// If too many consecutive errors, flush decoder and wait for next keyframe
+			if (ctx->consecutive_decode_errors >= 5) {
+				LOG_WARNING("Too many decode errors (%u), flushing decoder and waiting for keyframe", 
+				            ctx->consecutive_decode_errors);
+				avcodec_flush_buffers(ctx->codec_ctx);
+				ctx->got_keyframe = false;
+				ctx->consecutive_decode_errors = 0;
+			} else if (ctx->consecutive_decode_errors == 1) {
+				// Only log first error in a sequence
+				LOG_ERROR("Error receiving frame from decoder: %s", errbuf);
+			}
 		}
 		av_frame_free(&frame);
 		pthread_mutex_unlock(&ctx->mutex);
 		moq_consume_frame_close(frame_id);
 		return;
 	}
+	
+	// Successfully decoded a frame - reset error counter
+	ctx->consecutive_decode_errors = 0;
 
 	// Convert YUV420P to RGBA
 	uint8_t *dst_data[4] = {ctx->frame_buffer, NULL, NULL, NULL};
