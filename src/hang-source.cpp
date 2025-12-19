@@ -246,8 +246,8 @@ static void hang_source_update(void *data, obs_data_t *settings)
 
 static void hang_source_get_defaults(obs_data_t *settings)
 {
-	obs_data_set_default_string(settings, "url", "https://attention.us-central-2.ooda.video:4443");
-	obs_data_set_default_string(settings, "broadcast", "flyover-ranch/cam_192_168_42_190");
+	obs_data_set_default_string(settings, "url", "http://localhost:4443");
+	obs_data_set_default_string(settings, "broadcast", "obs/test");
 }
 
 static obs_properties_t *hang_source_properties(void *data)
