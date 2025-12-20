@@ -66,12 +66,6 @@ struct hang_source {
 	char *url;
 	char *broadcast;
 
-	// Pending settings - what user has typed but not yet applied
-	char *pending_url;
-	char *pending_broadcast;
-	uint64_t settings_changed_time;  // Timestamp when settings last changed
-	bool reconnect_pending;          // True if we need to reconnect after debounce
-
 	// Shutdown flag - set when destroy begins, callbacks should exit early
 	std::atomic<bool> shutting_down;
 
@@ -101,13 +95,9 @@ struct hang_source {
 	pthread_mutex_t mutex;
 };
 
-// Debounce delay in milliseconds (500ms = user stops typing for half a second)
-#define DEBOUNCE_DELAY_MS 500
-
 // Forward declarations
 static void hang_source_update(void *data, obs_data_t *settings);
 static void hang_source_destroy(void *data);
-static void hang_source_video_tick(void *data, float seconds);
 static obs_properties_t *hang_source_properties(void *data);
 static void hang_source_get_defaults(obs_data_t *settings);
 
@@ -128,12 +118,6 @@ static void *hang_source_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct hang_source *ctx = (struct hang_source *)bzalloc(sizeof(struct hang_source));
 	ctx->source = source;
-
-	// Initialize pending settings
-	ctx->pending_url = NULL;
-	ctx->pending_broadcast = NULL;
-	ctx->settings_changed_time = 0;
-	ctx->reconnect_pending = false;
 
 	// Initialize shutdown flag
 	ctx->shutting_down = false;
@@ -166,6 +150,8 @@ static void *hang_source_create(obs_data_t *settings, obs_source_t *source)
 	ctx->frame.format = VIDEO_FORMAT_RGBA;
 	ctx->frame.linesize[0] = 0;
 
+	// Load settings from OBS - this will auto-connect if settings are valid
+	// (hang_source_update detects settings changed from NULL and reconnects)
 	hang_source_update(ctx, settings);
 
 	return ctx;
@@ -199,8 +185,6 @@ static void hang_source_destroy(void *data)
 
 	bfree(ctx->url);
 	bfree(ctx->broadcast);
-	bfree(ctx->pending_url);
-	bfree(ctx->pending_broadcast);
 	// Note: frame_buffer is already freed by hang_source_disconnect_locked
 
 	pthread_mutex_destroy(&ctx->mutex);
@@ -217,31 +201,39 @@ static void hang_source_update(void *data, obs_data_t *settings)
 
 	pthread_mutex_lock(&ctx->mutex);
 
-	// Check if pending settings have changed
-	bool pending_changed = false;
-	
-	if (!ctx->pending_url || strcmp(ctx->pending_url, url) != 0) {
-		bfree(ctx->pending_url);
-		ctx->pending_url = bstrdup(url);
-		pending_changed = true;
-	}
+	// Check if settings actually changed
+	bool url_changed = (!ctx->url && url && strlen(url) > 0) ||
+	                   (ctx->url && !url) ||
+	                   (ctx->url && url && strcmp(ctx->url, url) != 0);
+	bool broadcast_changed = (!ctx->broadcast && broadcast && strlen(broadcast) > 0) ||
+	                         (ctx->broadcast && !broadcast) ||
+	                         (ctx->broadcast && broadcast && strcmp(ctx->broadcast, broadcast) != 0);
+	bool settings_changed = url_changed || broadcast_changed;
 
-	if (!ctx->pending_broadcast || strcmp(ctx->pending_broadcast, broadcast) != 0) {
-		bfree(ctx->pending_broadcast);
-		ctx->pending_broadcast = bstrdup(broadcast);
-		pending_changed = true;
-	}
+	// Store the new settings
+	bfree(ctx->url);
+	ctx->url = bstrdup(url);
+	bfree(ctx->broadcast);
+	ctx->broadcast = bstrdup(broadcast);
 
-	if (pending_changed) {
-		// Record the time of this change and mark reconnect as pending
-		// The actual reconnect will happen in video_tick after debounce delay
-		ctx->settings_changed_time = os_gettime_ns();
-		ctx->reconnect_pending = true;
-		LOG_DEBUG("Settings changed, scheduling reconnect after debounce (url=%s, broadcast=%s)", 
-		          url ? url : "(null)", broadcast ? broadcast : "(null)");
-	}
+	// Check if new settings are valid for connection
+	bool valid = ctx->url && ctx->broadcast && 
+	             strlen(ctx->url) > 0 && strlen(ctx->broadcast) > 0;
 
 	pthread_mutex_unlock(&ctx->mutex);
+
+	// If settings changed and are valid, reconnect
+	if (settings_changed && valid) {
+		LOG_INFO("Settings changed, reconnecting (url=%s, broadcast=%s)", 
+		         url ? url : "(null)", broadcast ? broadcast : "(null)");
+		hang_source_reconnect(ctx);
+	} else if (settings_changed && !valid) {
+		LOG_INFO("Settings changed but invalid - disconnecting");
+		pthread_mutex_lock(&ctx->mutex);
+		hang_source_disconnect_locked(ctx);
+		pthread_mutex_unlock(&ctx->mutex);
+		hang_source_blank_video(ctx);
+	}
 }
 
 static void hang_source_get_defaults(obs_data_t *settings)
@@ -262,82 +254,6 @@ static obs_properties_t *hang_source_properties(void *data)
 	return props;
 }
 
-// video_tick handles debounced reconnection - waits for user to stop typing
-static void hang_source_video_tick(void *data, float seconds)
-{
-	UNUSED_PARAMETER(seconds);
-	struct hang_source *ctx = (struct hang_source *)data;
-
-	pthread_mutex_lock(&ctx->mutex);
-
-	// Don't process during shutdown
-	if (ctx->shutting_down) {
-		pthread_mutex_unlock(&ctx->mutex);
-		return;
-	}
-
-	if (!ctx->reconnect_pending) {
-		pthread_mutex_unlock(&ctx->mutex);
-		return;
-	}
-
-	// Check if enough time has passed since last settings change (debounce)
-	uint64_t now = os_gettime_ns();
-	uint64_t elapsed_ms = (now - ctx->settings_changed_time) / 1000000;
-
-	if (elapsed_ms < DEBOUNCE_DELAY_MS) {
-		pthread_mutex_unlock(&ctx->mutex);
-		return;
-	}
-
-	// Debounce period elapsed - time to apply the pending settings
-	ctx->reconnect_pending = false;
-
-	// Check if pending settings differ from current active settings
-	bool url_changed = (!ctx->url && ctx->pending_url) ||
-	                   (ctx->url && !ctx->pending_url) ||
-	                   (ctx->url && ctx->pending_url && strcmp(ctx->url, ctx->pending_url) != 0);
-	bool broadcast_changed = (!ctx->broadcast && ctx->pending_broadcast) ||
-	                         (ctx->broadcast && !ctx->pending_broadcast) ||
-	                         (ctx->broadcast && ctx->pending_broadcast && strcmp(ctx->broadcast, ctx->pending_broadcast) != 0);
-
-	if (!url_changed && !broadcast_changed) {
-		// No actual change from current active connection
-		pthread_mutex_unlock(&ctx->mutex);
-		return;
-	}
-
-	// Apply pending settings as the new active settings
-	bfree(ctx->url);
-	ctx->url = ctx->pending_url ? bstrdup(ctx->pending_url) : NULL;
-	bfree(ctx->broadcast);
-	ctx->broadcast = ctx->pending_broadcast ? bstrdup(ctx->pending_broadcast) : NULL;
-
-	// Check if the new settings are valid
-	bool valid = ctx->url && ctx->broadcast && strlen(ctx->url) > 0 && strlen(ctx->broadcast) > 0;
-
-	if (!valid) {
-		// Invalid settings - disconnect and blank video
-		LOG_INFO("Invalid URL or broadcast - disconnecting and blanking video");
-		hang_source_disconnect_locked(ctx);
-		pthread_mutex_unlock(&ctx->mutex);
-		hang_source_blank_video(ctx);
-		return;
-	}
-
-	// Copy url and broadcast while holding mutex to avoid race condition in LOG_INFO
-	char *url_for_log = bstrdup(ctx->url);
-	char *broadcast_for_log = bstrdup(ctx->broadcast);
-
-	pthread_mutex_unlock(&ctx->mutex);
-
-	// Valid settings - reconnect
-	LOG_INFO("Debounce complete, reconnecting to %s / %s", url_for_log, broadcast_for_log);
-	bfree(url_for_log);
-	bfree(broadcast_for_log);
-	hang_source_reconnect(ctx);
-}
-
 // Forward declaration for use in callback
 static void hang_source_start_consume(struct hang_source *ctx, uint32_t expected_gen);
 
@@ -346,10 +262,15 @@ static void on_session_status(void *user_data, int32_t code)
 {
 	struct hang_source *ctx = (struct hang_source *)user_data;
 
-	// Check if we're shutting down - exit early to avoid use-after-free
-	pthread_mutex_lock(&ctx->mutex);
-	if (ctx->shutting_down) {
+	// Fast path: check atomic flag before taking lock
+	if (ctx->shutting_down.load()) {
 		LOG_DEBUG("Ignoring session status callback - shutting down");
+		return;
+	}
+
+	pthread_mutex_lock(&ctx->mutex);
+	// Double-check after acquiring lock (may have changed)
+	if (ctx->shutting_down.load()) {
 		pthread_mutex_unlock(&ctx->mutex);
 		return;
 	}
@@ -391,11 +312,18 @@ static void on_catalog(void *user_data, int32_t catalog)
 
 	LOG_INFO("Catalog callback received: %d", catalog);
 
+	// Fast path: check atomic flag before taking lock
+	if (ctx->shutting_down.load()) {
+		LOG_DEBUG("Ignoring catalog callback - shutting down");
+		if (catalog >= 0)
+			moq_consume_catalog_close(catalog);
+		return;
+	}
+
 	pthread_mutex_lock(&ctx->mutex);
 
-	// Check if we're shutting down - exit early to avoid use-after-free
-	if (ctx->shutting_down) {
-		LOG_DEBUG("Ignoring catalog callback - shutting down");
+	// Double-check after acquiring lock (may have changed)
+	if (ctx->shutting_down.load()) {
 		pthread_mutex_unlock(&ctx->mutex);
 		if (catalog >= 0)
 			moq_consume_catalog_close(catalog);
@@ -470,12 +398,18 @@ static void on_video_frame(void *user_data, int32_t frame_id)
 		return;
 	}
 
+	// Fast path: check atomic flag before taking lock
+	if (ctx->shutting_down.load()) {
+		moq_consume_frame_close(frame_id);
+		return;
+	}
+
 	// Check if this callback is still valid using generation (not video_track)
 	// Note: We can't check video_track here because frames may arrive before
 	// the track handle is stored in on_catalog (race condition)
 	pthread_mutex_lock(&ctx->mutex);
-	// Check if we're shutting down - exit early to avoid use-after-free
-	if (ctx->shutting_down) {
+	// Double-check after acquiring lock (may have changed)
+	if (ctx->shutting_down.load()) {
 		pthread_mutex_unlock(&ctx->mutex);
 		moq_consume_frame_close(frame_id);
 		return;
@@ -827,10 +761,16 @@ static void hang_source_destroy_decoder_locked(struct hang_source *ctx)
 
 static void hang_source_decode_frame(struct hang_source *ctx, int32_t frame_id)
 {
+	// Fast path: check atomic flag before taking lock
+	if (ctx->shutting_down.load()) {
+		moq_consume_frame_close(frame_id);
+		return;
+	}
+
 	pthread_mutex_lock(&ctx->mutex);
 
-	// Check if we're shutting down - exit early to avoid use-after-free
-	if (ctx->shutting_down) {
+	// Double-check after acquiring lock (may have changed)
+	if (ctx->shutting_down.load()) {
 		pthread_mutex_unlock(&ctx->mutex);
 		moq_consume_frame_close(frame_id);
 		return;
@@ -1075,8 +1015,6 @@ void register_hang_source()
 	info.update = hang_source_update;
 	info.get_defaults = hang_source_get_defaults;
 	info.get_properties = hang_source_properties;
-	// video_tick is needed for debounced reconnection (blur simulation)
-	info.video_tick = hang_source_video_tick;
 
 	obs_register_source(&info);
 }
