@@ -26,7 +26,6 @@ static AVCodecID codec_string_to_id(const char *codec, size_t len)
 
 	// H.264/AVC
 	if ((len >= 4 && strncasecmp(codec, "h264", 4) == 0) ||
-	    (len >= 4 && strncasecmp(codec, "avc1", 4) == 0) ||
 	    (len >= 3 && strncasecmp(codec, "avc", 3) == 0)) {
 		return AV_CODEC_ID_H264;
 	}
