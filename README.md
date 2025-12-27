@@ -11,53 +11,61 @@
 
 ## Installation
 
-### From Source
+### Setup
 
 Prerequisites:
 *   CMake 3.20+
 *   C++ Compiler (Clang/GCC/MSVC)
 *   OBS Studio development libraries (libobs)
-*   MoQ implementation from [kixelated/moq](https://github.com/kixelated/moq) (required for building the `moq` library)
-*   Fork of OBS-Studio from [brianmed/obs-studio](https://github.com/brianmed/obs-studio) to enable the MoQ service in the OBS Studio UI.
+*   [Fork of OBS-Studio](https://github.com/brianmed/obs-studio) just to show MoQ in the UI.
 
-1.  Clone the repository:
+1.  Clone the repos:
     ```bash
-    git clone https://github.com/qualabs/obs-moq.git
-    cd obs-moq
+    git clone https://github.com/moq-dev/obs.git moq-obs
+    git clone https://github.com/brianmed/obs-studio.git obs-studio
+
+    # optional: for local moq development
+    git clone https://github.com/moq-dev/moq.git moq
     ```
 
-2.  (temporary) Clone the moq repository if you haven't already:
+2. Build the OBS fork:
     ```bash
-    git clone https://github.com/kixelated/moq.git ../moq
-    ```
+    cd obs-studio
 
-3.  Configure the project with CMake:
-    ```bash
-    just setup ../moq
-
-    # Alternatively:
-    cmake --preset macos -DMOQ_LOCAL=../moq
-    ```
-
-4.  Build the plugin:
-    ```bash
-    just build
-
-    # Alternatively:
+    # Replace with your platform
+    cmake --preset macos
     cmake --build --preset macos
     ```
 
-5.  Install the plugin to your OBS Studio plugins directory.
+3.  Configure the plugin:
+    ```bash
+    cd moq-obs
+
+    just setup
+
+    # optional: for local moq development
+    just setup ../moq
+    ```
+
+### Build
+
+1.  Build the plugin:
+    ```bash
+    just build
+    ```
+
+2. Copy the plugin to the OBS Studio plugins directory:
 ```bash
 # macOS
+cp -a build_macos/RelWithDebInfo/obs-moq.plugin ../obs-studio/build_macos/frontend/RelWithDebInfo/OBS.app/Contents/PlugIns/
+
+# eventually, without the fork:
 cp -a build_macos/RelWithDebInfo/obs-moq.plugin ~/Library/Application\ Support/obs-studio/plugins/
 ```
 
-5a. Or if you're building against a local obs-studio checkout:
+3. Run OBS Studio with some extra logging for debugging.
 ```bash
-cp -a build_macos/RelWithDebInfo/obs-moq.plugin ../obs-studio/build_macos/frontend/RelWithDebInfo/OBS.app/Contents/PlugIns/
-
-# Run OBS Studio with some extra logging for debugging.
+# macOS
 RUST_LOG=debug RUST_BACKTRACE=1 OBS_LOG_LEVEL=debug ../obs-studio/build_macos/frontend/RelWithDebInfo/OBS.app/Contents/MacOS/OBS
 ```
 
@@ -65,11 +73,15 @@ RUST_LOG=debug RUST_BACKTRACE=1 OBS_LOG_LEVEL=debug ../obs-studio/build_macos/fr
 
 1.  Open OBS Studio.
 2.  Go to **Settings** > **Stream**.
-3.  In the **Service** dropdown, select **MoQ (Debug)**.
+3.  In the **Service** dropdown, select **MoQ**.
 4.  Enter your MoQ Server details:
-    *   **Server:** The URL of your MoQ relay/server (e.g., `http://localhost:4433/anon`).
-    *   **Key:** The stream path or key (e.g., `dev`).
+    * For development (`just dev`): `http://localhost:4433/anon`.
+    * For testing: `https://cdn.moq.dev/anon`.
+5.  Enter the broadcast name/path:
+    * For testing: `obs` or some unique string.
+    * Watch it here: https://moq.dev/watch/?name=obs
 5.  Configure your Output settings (Codecs, Bitrate) as desired.
+    * Currently, only: `h264` and `aac` are supported.
 6.  Start Streaming!
 
 ## Supported Build Environments
