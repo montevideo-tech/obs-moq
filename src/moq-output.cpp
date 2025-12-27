@@ -84,7 +84,7 @@ bool MoQOutput::Start()
 
 	// Start establishing a session with the MoQ server
 	// NOTE: You could publish the same broadcasts to multiple sessions if you want (redundant ingest).
-	session = moq_session_connect(server_url.data(), server_url.size(), origin, NULL, session_connect_callback, this);
+	session = moq_session_connect(server_url.data(), server_url.size(), origin, 0, session_connect_callback, this);
 	if (session < 0) {
 		LOG_ERROR("Failed to initialize MoQ server: %d", session);
 		return false;

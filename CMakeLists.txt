@@ -51,9 +51,17 @@ if(ENABLE_QT)
   )
 endif()
 
+# FFmpeg dependency
+include(FindPkgConfig)
+pkg_check_modules(FFMPEG REQUIRED libavcodec libavutil libswscale libswresample)
+target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE ${FFMPEG_INCLUDE_DIRS})
+target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE ${FFMPEG_LIBRARY_DIRS})
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${FFMPEG_LIBRARIES})
+
 target_sources(
   ${CMAKE_PROJECT_NAME}
   PRIVATE src/obs-moq.cpp src/moq-output.h src/moq-service.h src/moq-output.cpp src/moq-service.cpp
+          src/moq-source.cpp src/moq-source.h
 )
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})

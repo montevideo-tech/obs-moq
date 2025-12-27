@@ -20,6 +20,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "moq-output.h"
 #include "moq-service.h"
+#include "moq-source.h"
 
 extern "C" {
 #include "moq.h"
@@ -40,6 +41,7 @@ bool obs_module_load(void)
 
 	register_moq_output();
 	register_moq_service();
+	register_moq_source();
 
 	return true;
 }
