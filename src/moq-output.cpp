@@ -272,8 +272,7 @@ void register_moq_output()
 {
 	const uint32_t base_flags = OBS_OUTPUT_ENCODED | OBS_OUTPUT_SERVICE;
 
-	// TODO: Add support for other codecs.
-	const char *audio_codecs = "aac";
+	const char *audio_codecs = "aac;opus";
 	// TODO: Add support for other codecs.
 	const char *video_codecs = "h264";
 
