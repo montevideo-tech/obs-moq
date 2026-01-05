@@ -275,7 +275,7 @@ void register_moq_output()
 	// TODO: Add support for other codecs.
 	const char *audio_codecs = "aac";
 	// TODO: Add support for other codecs.
-	const char *video_codecs = "h264";
+	const char *video_codecs = "h264;av1";
 
 	struct obs_output_info info = {};
 	info.id = "moq_output";

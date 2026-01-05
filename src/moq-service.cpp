@@ -2,7 +2,7 @@
 
 // TODO: Define supported codecs.
 const char *audio_codecs[] = {"aac", nullptr};
-const char *video_codecs[] = {"h264", nullptr};
+const char *video_codecs[] = {"h264", "av1", nullptr};
 
 MoQService::MoQService(obs_data_t *settings, obs_service_t *) : server(), path()
 {
@@ -37,10 +37,10 @@ void MoQService::ApplyEncoderSettings(obs_data_t *video_settings, obs_data_t *au
      */
 
 	// Example:
-	if (video_settings) {
-		obs_data_set_int(video_settings, "bf", 0);
-		obs_data_set_bool(video_settings, "repeat_headers", true);
-	}
+    if (video_settings) {
+        obs_data_set_int(video_settings, "bf", 0);
+        obs_data_set_bool(video_settings, "repeat_headers", true);
+    }
 
 	if (audio_settings) {
 		obs_data_set_int(audio_settings, "bf", 0);
