@@ -2,7 +2,7 @@
 
 // TODO: Define supported codecs.
 const char *audio_codecs[] = {"aac", "opus", nullptr};
-const char *video_codecs[] = {"h264", nullptr};
+const char *video_codecs[] = {"h264", "hevc", nullptr};
 
 MoQService::MoQService(obs_data_t *settings, obs_service_t *) : server(), path()
 {
