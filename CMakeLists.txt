@@ -13,7 +13,7 @@ include(helpers)
 
 add_library(obs-moq MODULE)
 
-if(NOT BUILD_PLUGIN)
+if(NOT ${BUILD_PLUGIN})
   find_package(libobs REQUIRED)
 endif()
 target_link_libraries(obs-moq PRIVATE OBS::libobs)
@@ -73,7 +73,7 @@ target_sources(
     src/moq-source.h
 )
 
-if(BUILD_PLUGIN)
+if(${BUILD_PLUGIN})
   set_target_properties_plugin(obs-moq PROPERTIES OUTPUT_NAME ${_name})
 else()
   set_target_properties_obs(obs-moq PROPERTIES FOLDER plugins PREFIX "")
