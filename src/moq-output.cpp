@@ -156,9 +156,17 @@ void MoQOutput::AudioData(struct encoder_packet *packet)
 		return;
 	}
 
-	auto pts = util_mul_div64(packet->pts, 1000000ULL * packet->timebase_num, packet->timebase_den);
+	// Add ~1 second offset to handle negative PTS from audio priming frames.
+	// TODO: This is slightly wrong when den is not evenly divisible by num, but close enough.
+	int64_t pts = packet->pts + packet->timebase_den / packet->timebase_num;
+	if (pts < 0) {
+		LOG_WARNING("Dropping audio frame with negative PTS: %lld", (long long)packet->pts);
+		return;
+	}
 
-	auto result = moq_publish_media_frame(audio, packet->data, packet->size, pts);
+	auto pts_us = util_mul_div64(pts, 1000000ULL * packet->timebase_num, packet->timebase_den);
+
+	auto result = moq_publish_media_frame(audio, packet->data, packet->size, pts_us);
 	if (result < 0) {
 		LOG_ERROR("Failed to write audio frame: %d", result);
 		return;
@@ -177,9 +185,17 @@ void MoQOutput::VideoData(struct encoder_packet *packet)
 		return;
 	}
 
-	auto pts = util_mul_div64(packet->pts, 1000000ULL * packet->timebase_num, packet->timebase_den);
+	// Add ~1 second offset to match audio for A/V sync.
+	// TODO: This is slightly wrong when den is not evenly divisible by num, but close enough.
+	int64_t pts = packet->pts + packet->timebase_den / packet->timebase_num;
+	if (pts < 0) {
+		LOG_WARNING("Dropping video frame with negative PTS: %lld", (long long)packet->pts);
+		return;
+	}
 
-	auto result = moq_publish_media_frame(video, packet->data, packet->size, pts);
+	auto pts_us = util_mul_div64(pts, 1000000ULL * packet->timebase_num, packet->timebase_den);
+
+	auto result = moq_publish_media_frame(video, packet->data, packet->size, pts_us);
 	if (result < 0) {
 		LOG_ERROR("Failed to write video frame: %d", result);
 		return;
